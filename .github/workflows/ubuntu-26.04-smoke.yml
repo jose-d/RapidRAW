@@ -1,0 +1,24 @@
+name: Ubuntu 26.04 x86_64 smoke build
+
+on:
+  push:
+    branches:
+      - ci/ubuntu-26.04-x86_64-smoke
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build-args: ''
+            asset-prefix: 'ubuntu-26.04-smoke'
+          - build-args: '--features tethering'
+            asset-prefix: 'ubuntu-26.04-tethering-smoke'
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: ubuntu-26.04
+      target: ''
+      build-args: ${{ matrix.build-args }}
+      asset-prefix: ${{ matrix.asset-prefix }}
+    secrets: inherit
