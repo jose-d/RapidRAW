@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useUIStore } from '../store/useUIStore';
+import { closeMergeModal, useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 
 export function useAndroidBackHandler() {
@@ -46,38 +46,8 @@ export function useAndroidBackHandler() {
         ui.setUI({ isRenameAlbumModalOpen: false });
         return;
       }
-      if (ui.panoramaModalState.isOpen) {
-        ui.setUI({
-          panoramaModalState: {
-            isOpen: false,
-            isProcessing: false,
-            progressMessage: '',
-            finalImageBase64: null,
-            error: null,
-            stitchingSourcePaths: [],
-          },
-        });
-        return;
-      }
-      if (ui.hdrModalState.isOpen) {
-        ui.setUI({
-          hdrModalState: {
-            isOpen: false,
-            isProcessing: false,
-            progressMessage: '',
-            finalImageBase64: null,
-            error: null,
-            stitchingSourcePaths: [],
-          },
-        });
-        return;
-      }
-      if (ui.negativeModalState.isOpen) {
-        ui.setUI((state: any) => ({ negativeModalState: { ...state.negativeModalState, isOpen: false } }));
-        return;
-      }
-      if (ui.denoiseModalState.isOpen) {
-        ui.setUI((state: any) => ({ denoiseModalState: { ...state.denoiseModalState, isOpen: false } }));
+      if (ui.mergeModalState.isOpen) {
+        closeMergeModal();
         return;
       }
       if (ui.cullingModalState.isOpen) {
@@ -91,7 +61,9 @@ export function useAndroidBackHandler() {
         return;
       }
 
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }),
+      );
     };
 
     return () => {

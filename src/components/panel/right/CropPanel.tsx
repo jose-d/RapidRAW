@@ -11,32 +11,66 @@ import {
   Ruler,
   Scan,
   X,
+  ChevronDown,
+  ChevronRight,
+  Cuboid,
+  Check,
+  Loader,
+  SquareDashed,
+  Activity,
+  CircleDashed,
+  Minus,
+  Trash2,
+  Info,
+  Ban,
+  Save,
+  ScanLine,
 } from 'lucide-react';
-import { useTranslation } from 'react-i18next';
-import { Adjustments, INITIAL_ADJUSTMENTS } from '../../../utils/adjustments';
+import { useTranslation, Trans } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
+import { Adjustments } from '../../../utils/adjustments';
+import { getDefaultAdjustments, getOpenImageDefaults } from '../../../utils/developDefaults';
 import clsx from 'clsx';
-import { Orientation } from '../../ui/AppProperties';
-import TransformModal from '../../modals/TransformModal';
-import LensCorrectionModal from '../../modals/LensCorrectionModal';
-import { motion } from 'framer-motion';
+import { CustomAspectRatio } from '../../../types/settings';
+import { Orientation } from '../../../types/ui';
+import { motion, AnimatePresence } from 'framer-motion';
 import Text from '../../ui/Text';
 import Slider from '../../ui/Slider';
+import Switch from '../../ui/Switch';
+import Dropdown from '../../ui/Dropdown';
 import { TEXT_COLOR_KEYS, TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useEditorActions } from '../../../hooks/useEditorActions';
-import { calculateAreaPreservingCrop, calculateCenteredCrop } from '../../../utils/cropUtils';
+import {
+  calculateAreaPreservingCrop,
+  calculateCenteredCrop,
+  getOrientedDimensions,
+  MAX_FINE_ROTATION,
+  ORIGINAL_RATIO,
+  resolveAspectRatio,
+} from '../../../utils/cropUtils';
 import { Crop } from 'react-image-crop';
+import { useShallow } from 'zustand/react/shallow';
+import { useUIStore } from '../../../store/useUIStore';
+import { useContextMenu } from '../../../context/ContextMenuContext';
+import { useSettingsStore } from '../../../store/useSettingsStore';
+import { OverlayMode } from '../../../types/editor';
 
 const BASE_RATIO = 1.618;
-const ORIGINAL_RATIO = 0;
 const RATIO_TOLERANCE = 0.01;
-
-export type OverlayMode = 'none' | 'thirds' | 'goldenTriangle' | 'goldenSpiral' | 'phiGrid' | 'armature' | 'diagonal';
 
 interface CropPreset {
   name: string;
   value: number | null;
   tooltip: string;
+}
+
+interface LensCorrectionInfo {
+  maker: string;
+  model: string;
+  distortion: boolean;
+  tca: boolean;
+  vignetting: boolean;
 }
 
 interface OverlayOption {
@@ -45,24 +79,74 @@ interface OverlayOption {
   tooltip: string;
 }
 
+const greatestCommonDivisor = (a: number, b: number): number => (b === 0 ? a : greatestCommonDivisor(b, a % b));
+
+const formatRatioLabel = (width: number, height: number): string => {
+  if (Number.isInteger(width) && Number.isInteger(height)) {
+    const divisor = greatestCommonDivisor(width, height);
+    const reducedWidth = width / divisor;
+    const reducedHeight = height / divisor;
+    if (reducedWidth <= 99 && reducedHeight <= 99) {
+      return `${reducedWidth}:${reducedHeight}`;
+    }
+  }
+  return `${Number((width / height).toFixed(2))}:1`;
+};
+
 export default function CropPanel() {
   const { t } = useTranslation();
+  const { showContextMenu } = useContextMenu();
+  const { appSettings, handleSettingsChange } = useSettingsStore(
+    useShallow((state) => ({
+      appSettings: state.appSettings,
+      handleSettingsChange: state.handleSettingsChange,
+    })),
+  );
   const selectedImage = useEditorStore((s) => s.selectedImage);
   const adjustments = useEditorStore((s) => s.adjustments);
   const isStraightenActive = useEditorStore((s) => s.isStraightenActive);
+  const isAutoStraightening = useEditorStore((s) => s.isAutoStraightening);
+  const isGuidedPerspectiveActive = useEditorStore((s) => s.isGuidedPerspectiveActive);
   const activeOverlay = useEditorStore((s) => s.overlayMode);
+  const liveRotation = useEditorStore((s) => s.liveRotation);
   const setEditor = useEditorStore((s) => s.setEditor);
-  const { setAdjustments, handleRotate } = useEditorActions();
+  const { setAdjustments, handleRotate, handleAutoStraighten } = useEditorActions();
+
   const [customW, setCustomW] = useState('');
   const [customH, setCustomH] = useState('');
-  const [isTransformModalOpen, setIsTransformModalOpen] = useState(false);
-  const [isLensModalOpen, setIsLensModalOpen] = useState(false);
   const [isRotationActive, setIsRotationActive] = useState(false);
   const [preferPortrait, setPreferPortrait] = useState(false);
   const [isEditingCustom, setIsEditingCustom] = useState(false);
-
-  const [localRotation, setLocalRotation] = useState<number | null>(null);
+  const [isCustomMode, setIsCustomMode] = useState(false);
+  const [makers, setMakers] = useState<string[]>([]);
+  const [lenses, setLenses] = useState<string[]>([]);
+  const [myLenses, setMyLenses] = useState<any[]>([]);
+  const [lensInfo, setLensInfo] = useState<LensCorrectionInfo | null | undefined>(undefined);
   const localRotationRef = useRef<number | null>(null);
+
+  const lensMode = adjustments.lensCorrectionMode || 'manual';
+
+  const [modeBubbleStyle, setModeBubbleStyle] = useState({});
+  const isModeInitialAnimation = useRef(true);
+
+  const { cropSectionsState, setUI } = useUIStore(
+    useShallow((s) => ({
+      cropSectionsState: s.cropSectionsState,
+      setUI: s.setUI,
+    })),
+  );
+
+  const isTransformExpanded = cropSectionsState.transform;
+  const isLensExpanded = cropSectionsState.lens;
+
+  const toggleSection = (section: 'transform' | 'lens') => {
+    setUI((state) => ({
+      cropSectionsState: {
+        ...state.cropSectionsState,
+        [section]: !state.cropSectionsState[section],
+      },
+    }));
+  };
 
   const PRESETS = useMemo<Array<CropPreset>>(
     () => [
@@ -82,6 +166,24 @@ export default function CropPanel() {
     ],
     [t],
   );
+
+  const savedAspectRatios = useMemo<Array<CustomAspectRatio>>(
+    () =>
+      (appSettings?.customAspectRatios ?? []).filter((ratio: CustomAspectRatio) => ratio.width > 0 && ratio.height > 0),
+    [appSettings?.customAspectRatios],
+  );
+
+  const SAVED_PRESETS = useMemo<Array<CropPreset>>(
+    () =>
+      savedAspectRatios.map((ratio: CustomAspectRatio) => ({
+        name: formatRatioLabel(ratio.width, ratio.height),
+        value: ratio.width / ratio.height,
+        tooltip: t('editor.crop.custom.savedTooltip', { ratio: `${ratio.width}:${ratio.height}` }),
+      })),
+    [savedAspectRatios, t],
+  );
+
+  const ALL_PRESETS = useMemo<Array<CropPreset>>(() => [...PRESETS, ...SAVED_PRESETS], [PRESETS, SAVED_PRESETS]);
 
   const OVERLAYS = useMemo<Array<OverlayOption>>(
     () => [
@@ -108,13 +210,13 @@ export default function CropPanel() {
         name: t('editor.crop.overlays.armature.name'),
         tooltip: t('editor.crop.overlays.armature.desc'),
       },
+      { id: 'center', name: t('editor.crop.overlays.center.name'), tooltip: t('editor.crop.overlays.center.desc') },
     ],
     [t],
   );
 
   const updateLocalRotation = useCallback(
     (val: number | null) => {
-      setLocalRotation(val);
       localRotationRef.current = val;
       setEditor({ liveRotation: val });
     },
@@ -134,7 +236,50 @@ export default function CropPanel() {
 
   const lastSyncedRatio = useRef<number | null>(null);
 
-  const { aspectRatio, rotation = 0, flipHorizontal = false, flipVertical = false, orientationSteps = 0 } = adjustments;
+  const { rotation = 0, flipHorizontal = false, flipVertical = false, orientationSteps = 0 } = adjustments;
+  const aspectRatio = resolveAspectRatio(adjustments.aspectRatio, selectedImage, orientationSteps);
+  const originalRatio = resolveAspectRatio(ORIGINAL_RATIO, selectedImage, orientationSteps);
+  const originalDimensions =
+    selectedImage?.width && selectedImage?.height
+      ? getOrientedDimensions(selectedImage.width, selectedImage.height, orientationSteps)
+      : null;
+
+  useEffect(() => {
+    invoke('get_lensfun_makers')
+      .then((m: any) => setMakers(m))
+      .catch(console.error);
+
+    invoke('load_settings').then((settings: any) => {
+      if (settings?.myLenses) setMyLenses(settings.myLenses);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (adjustments.lensMaker) {
+      invoke('get_lensfun_lenses_for_maker', { maker: adjustments.lensMaker })
+        .then((l: any) => setLenses(l))
+        .catch(console.error);
+    } else {
+      setLenses([]);
+    }
+  }, [adjustments.lensMaker]);
+
+  useEffect(() => {
+    if (!selectedImage?.path) {
+      setLensInfo(null);
+      return;
+    }
+    let active = true;
+    invoke<LensCorrectionInfo | null>('get_lens_correction_info', {
+      path: selectedImage.path,
+      selection: { lensCorrectionMode: lensMode, lensMaker: adjustments.lensMaker, lensModel: adjustments.lensModel },
+    })
+      .then((info) => active && setLensInfo(info))
+      .catch(() => active && setLensInfo(null));
+    return () => {
+      active = false;
+    };
+  }, [selectedImage?.path, lensMode, adjustments.lensMaker, adjustments.lensModel]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -166,22 +311,16 @@ export default function CropPanel() {
     };
   }, [setEditor]);
 
-  const getEffectiveOriginalRatio = useCallback(() => {
-    if (!selectedImage?.width || !selectedImage?.height) {
-      return null;
-    }
-    const isSwapped = orientationSteps === 1 || orientationSteps === 3;
-    const W = isSwapped ? selectedImage.height : selectedImage.width;
-    const H = isSwapped ? selectedImage.width : selectedImage.height;
-    return W > 0 && H > 0 ? W / H : null;
-  }, [selectedImage, orientationSteps]);
-
   const activePreset = useMemo(() => {
+    if (adjustments.aspectRatio === ORIGINAL_RATIO) {
+      return PRESETS.find((p: CropPreset) => p.value === ORIGINAL_RATIO);
+    }
+
     if (aspectRatio === null) {
       return PRESETS.find((p: CropPreset) => p.value === null);
     }
 
-    const numericPresetMatch = PRESETS.find(
+    const numericPresetMatch = ALL_PRESETS.find(
       (p: CropPreset) =>
         p.value &&
         p.value !== ORIGINAL_RATIO &&
@@ -192,26 +331,30 @@ export default function CropPanel() {
       return numericPresetMatch;
     }
 
-    const originalRatio = getEffectiveOriginalRatio();
     if (originalRatio && Math.abs(aspectRatio - originalRatio) < RATIO_TOLERANCE) {
       return PRESETS.find((p: CropPreset) => p.value === ORIGINAL_RATIO);
     }
 
     return null;
-  }, [aspectRatio, getEffectiveOriginalRatio, PRESETS]);
+  }, [adjustments.aspectRatio, aspectRatio, originalRatio, PRESETS, ALL_PRESETS]);
 
   let orientation = Orientation.Horizontal;
   if (activePreset && activePreset.value && activePreset.value !== 1) {
     let baseRatio: number | null = activePreset.value;
     if (activePreset.value === ORIGINAL_RATIO) {
-      baseRatio = getEffectiveOriginalRatio();
+      baseRatio = originalRatio;
     }
     if (baseRatio && aspectRatio && Math.abs(aspectRatio - baseRatio) > RATIO_TOLERANCE) {
       orientation = Orientation.Vertical;
     }
   }
 
-  const isCustomActive = aspectRatio !== null && !activePreset;
+  const isCustomActive = aspectRatio !== null && (isCustomMode || !activePreset);
+  const selectedPreset = isCustomActive ? null : activePreset;
+
+  useEffect(() => {
+    setIsCustomMode(false);
+  }, [selectedImage?.path]);
 
   useEffect(() => {
     if (aspectRatio && aspectRatio !== 1) {
@@ -243,30 +386,21 @@ export default function CropPanel() {
       }
       let newCrop: Crop | null = null;
       if (selectedImage?.width && selectedImage?.height) {
+        const ratio = resolveAspectRatio(newAspectRatio, selectedImage, orientationSteps);
         newCrop =
           calculateAreaPreservingCrop(
             selectedImage.width,
             selectedImage.height,
             orientationSteps,
-            newAspectRatio,
+            ratio,
             rotation,
             adjustments.crop,
-          ) ??
-          calculateCenteredCrop(selectedImage.width, selectedImage.height, orientationSteps, newAspectRatio, rotation);
+          ) ?? calculateCenteredCrop(selectedImage.width, selectedImage.height, orientationSteps, ratio, rotation);
       }
       setAdjustments((prev: Adjustments) => ({ ...prev, aspectRatio: newAspectRatio, crop: newCrop }));
     },
     [selectedImage, orientationSteps, rotation, adjustments.crop, setAdjustments],
   );
-
-  useEffect(() => {
-    if (activePreset?.value === ORIGINAL_RATIO) {
-      const newOriginalRatio = getEffectiveOriginalRatio();
-      if (newOriginalRatio !== null && aspectRatio && Math.abs(aspectRatio - newOriginalRatio) > RATIO_TOLERANCE) {
-        applyAspectRatio(newOriginalRatio);
-      }
-    }
-  }, [orientationSteps, activePreset, aspectRatio, getEffectiveOriginalRatio, applyAspectRatio]);
 
   const handleCustomInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -298,9 +432,11 @@ export default function CropPanel() {
   const handleCustomInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       e.preventDefault();
+      e.stopPropagation();
       handleApplyCustomRatio();
       (e.target as HTMLInputElement).blur();
     } else if (e.key === 'Escape') {
+      e.stopPropagation();
       setIsEditingCustom(false);
       if (aspectRatio) {
         const h = 100;
@@ -312,14 +448,50 @@ export default function CropPanel() {
     }
   };
 
+  const customRatioToSave = useMemo(() => {
+    const numW = parseFloat(customW);
+    const numH = parseFloat(customH);
+    if (!(numW > 0) || !(numH > 0)) {
+      return null;
+    }
+
+    const width = Math.max(numW, numH);
+    const height = Math.min(numW, numH);
+    const ratio = width / height;
+    const isDuplicate = ALL_PRESETS.some(
+      (p: CropPreset) => p.value && p.value !== ORIGINAL_RATIO && Math.abs(ratio - p.value) < RATIO_TOLERANCE,
+    );
+
+    return isDuplicate ? null : { width, height };
+  }, [customW, customH, ALL_PRESETS]);
+
+  const handleSaveCustomRatio = () => {
+    if (!appSettings || !customRatioToSave) {
+      return;
+    }
+    handleSettingsChange({ ...appSettings, customAspectRatios: [...savedAspectRatios, customRatioToSave] });
+  };
+
+  const handleRemoveSavedRatio = (index: number) => {
+    if (!appSettings) {
+      return;
+    }
+    handleSettingsChange({
+      ...appSettings,
+      customAspectRatios: savedAspectRatios.filter((_: CustomAspectRatio, i: number) => i !== index),
+    });
+  };
+
   const handlePresetClick = (preset: CropPreset) => {
+    setIsCustomMode(false);
+
     if (preset.value === ORIGINAL_RATIO) {
-      applyAspectRatio(getEffectiveOriginalRatio());
+      applyAspectRatio(ORIGINAL_RATIO);
       return;
     }
 
     const targetRatio = preset.value;
-    if (activePreset === preset && targetRatio && targetRatio !== 1) {
+    if (selectedPreset === preset && targetRatio && targetRatio !== 1) {
       const newRatio = 1 / (adjustments.aspectRatio ? adjustments.aspectRatio : 1);
       setPreferPortrait(newRatio < 1);
       applyAspectRatio(newRatio);
@@ -346,58 +518,56 @@ export default function CropPanel() {
     }
   }, [aspectRatio, applyAspectRatio]);
 
-  const handleReset = () => {
-    const originalAspectRatio =
-      selectedImage?.width && selectedImage?.height ? selectedImage.width / selectedImage.height : null;
-
+  const handleReset = async () => {
     setPreferPortrait(false);
     setIsEditingCustom(false);
+    setIsCustomMode(false);
     lastSyncedRatio.current = null;
     updateLocalRotation(null);
 
     setOverlay('thirds');
 
+    const defaults = await getOpenImageDefaults();
     setAdjustments((prev: Adjustments) => ({
       ...prev,
-      aspectRatio: originalAspectRatio,
-      crop: INITIAL_ADJUSTMENTS.crop,
-      flipHorizontal: INITIAL_ADJUSTMENTS.flipHorizontal ?? false,
-      flipVertical: INITIAL_ADJUSTMENTS.flipVertical ?? false,
-      orientationSteps: INITIAL_ADJUSTMENTS.orientationSteps ?? 0,
-      rotation: INITIAL_ADJUSTMENTS.rotation ?? 0,
-      transformDistortion: INITIAL_ADJUSTMENTS.transformDistortion ?? 0,
-      transformVertical: INITIAL_ADJUSTMENTS.transformVertical ?? 0,
-      transformHorizontal: INITIAL_ADJUSTMENTS.transformHorizontal ?? 0,
-      transformRotate: INITIAL_ADJUSTMENTS.transformRotate ?? 0,
-      transformAspect: INITIAL_ADJUSTMENTS.transformAspect ?? 0,
-      transformScale: INITIAL_ADJUSTMENTS.transformScale ?? 100,
-      transformXOffset: INITIAL_ADJUSTMENTS.transformXOffset ?? 0,
-      transformYOffset: INITIAL_ADJUSTMENTS.transformYOffset ?? 0,
-      guidedPerspective: INITIAL_ADJUSTMENTS.guidedPerspective,
-      lensMaker: INITIAL_ADJUSTMENTS.lensMaker,
-      lensModel: INITIAL_ADJUSTMENTS.lensModel,
-      lensDistortionAmount: INITIAL_ADJUSTMENTS.lensDistortionAmount,
-      lensVignetteAmount: INITIAL_ADJUSTMENTS.lensVignetteAmount,
-      lensTcaAmount: INITIAL_ADJUSTMENTS.lensTcaAmount,
-      lensDistortionEnabled: INITIAL_ADJUSTMENTS.lensDistortionEnabled,
-      lensTcaEnabled: INITIAL_ADJUSTMENTS.lensTcaEnabled,
-      lensVignetteEnabled: INITIAL_ADJUSTMENTS.lensVignetteEnabled,
-      lensDistortionParams: INITIAL_ADJUSTMENTS.lensDistortionParams,
-      lensCorrectionMode: INITIAL_ADJUSTMENTS.lensCorrectionMode,
+      aspectRatio: defaults.aspectRatio,
+      crop: defaults.crop,
+      flipHorizontal: defaults.flipHorizontal ?? false,
+      flipVertical: defaults.flipVertical ?? false,
+      orientationSteps: defaults.orientationSteps ?? 0,
+      rotation: defaults.rotation ?? 0,
+      transformDistortion: defaults.transformDistortion ?? 0,
+      transformVertical: defaults.transformVertical ?? 0,
+      transformHorizontal: defaults.transformHorizontal ?? 0,
+      transformRotate: defaults.transformRotate ?? 0,
+      transformAspect: defaults.transformAspect ?? 0,
+      transformScale: defaults.transformScale ?? 100,
+      transformXOffset: defaults.transformXOffset ?? 0,
+      transformYOffset: defaults.transformYOffset ?? 0,
+      guidedPerspective: defaults.guidedPerspective,
+      lensMaker: defaults.lensMaker,
+      lensModel: defaults.lensModel,
+      lensDistortionAmount: defaults.lensDistortionAmount,
+      lensVignetteAmount: defaults.lensVignetteAmount,
+      lensTcaAmount: defaults.lensTcaAmount,
+      lensDistortionEnabled: defaults.lensDistortionEnabled,
+      lensTcaEnabled: defaults.lensTcaEnabled,
+      lensVignetteEnabled: defaults.lensVignetteEnabled,
+      lensCorrectionMode: defaults.lensCorrectionMode,
     }));
   };
 
-  const isPresetActive = (preset: CropPreset) => preset === activePreset;
-  const isOrientationToggleDisabled = !aspectRatio || aspectRatio === 1 || activePreset?.value === ORIGINAL_RATIO;
+  const isPresetActive = (preset: CropPreset) => preset === selectedPreset;
+  const isOrientationToggleDisabled = !aspectRatio || aspectRatio === 1 || selectedPreset?.value === ORIGINAL_RATIO;
 
   const fineRotation = useMemo(() => {
     return rotation || 0;
   }, [rotation]);
 
-  const displayRotation = localRotation !== null ? localRotation : fineRotation;
+  const displayRotation = liveRotation ?? fineRotation;
 
-  const handleFineRotationChange = (e: any) => {
-    const newFineRotation = parseFloat(e.target.value);
+  const handleFineRotationChange = (e: { target: { value: number | string } }) => {
+    const newFineRotation = parseFloat(String(e.target.value));
     if (isRotationActive) {
       updateLocalRotation(newFineRotation);
     } else {
@@ -451,6 +621,137 @@ export default function CropPanel() {
     [setEditor, updateLocalRotation, setAdjustments],
   );
 
+  const handleMakerChange = useCallback(
+    (maker: string) => {
+      setAdjustments((prev) => ({ ...prev, lensMaker: maker, lensModel: null }));
+      setLenses([]);
+    },
+    [setAdjustments],
+  );
+
+  const handleModelChange = useCallback(
+    (model: string) => setAdjustments((prev) => ({ ...prev, lensModel: model })),
+    [setAdjustments],
+  );
+
+  const handleMyLensSelect = useCallback(
+    (val: string) => {
+      if (!val || val === 'none') return;
+      const selected = myLenses[parseInt(val)];
+      if (!selected) return;
+
+      invoke('get_lensfun_lenses_for_maker', { maker: selected.maker })
+        .then((l: any) => setLenses(l))
+        .catch(console.error);
+
+      setAdjustments((prev) => ({ ...prev, lensMaker: selected.maker, lensModel: selected.model }));
+    },
+    [myLenses, setAdjustments],
+  );
+
+  const hasDistortion = !!lensInfo?.distortion;
+  const hasTca = !!lensInfo?.tca;
+  const hasVignetting = !!lensInfo?.vignetting;
+
+  const myLensOptions = useMemo(() => {
+    if (myLenses.length === 0) {
+      return [{ label: t('modals.lensCorrection.manageLensesPlaceholder'), value: 'none' }];
+    }
+    return myLenses.map((l, i) => ({
+      label: `${l.maker} - ${l.model}`,
+      value: i.toString(),
+    }));
+  }, [myLenses, t]);
+
+  useEffect(() => {
+    const selectedIndex = lensMode === 'auto' ? 0 : 1;
+    const targetX = `${selectedIndex * 100}%`;
+    const targetWidth = '50%';
+
+    if (isModeInitialAnimation.current) {
+      const initialX = lensMode === 'manual' ? '100%' : '-25%';
+      setModeBubbleStyle({
+        x: [initialX, targetX],
+        width: targetWidth,
+      });
+      isModeInitialAnimation.current = false;
+    } else {
+      setModeBubbleStyle({
+        x: targetX,
+        width: targetWidth,
+      });
+    }
+  }, [lensMode]);
+
+  const handleModeChange = useCallback(
+    (mode: 'auto' | 'manual') => setAdjustments((prev) => ({ ...prev, lensCorrectionMode: mode })),
+    [setAdjustments],
+  );
+
+  const handleTransformContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const handleResetTransform = () => {
+      setEditor({ isGuidedPerspectiveActive: false });
+      const defaults = getDefaultAdjustments();
+      setAdjustments((prev: Adjustments) => ({
+        ...prev,
+        transformDistortion: defaults.transformDistortion ?? 0,
+        transformVertical: defaults.transformVertical ?? 0,
+        transformHorizontal: defaults.transformHorizontal ?? 0,
+        transformRotate: defaults.transformRotate ?? 0,
+        transformAspect: defaults.transformAspect ?? 0,
+        transformScale: defaults.transformScale ?? 100,
+        transformXOffset: defaults.transformXOffset ?? 0,
+        transformYOffset: defaults.transformYOffset ?? 0,
+        guidedPerspective: defaults.guidedPerspective,
+      }));
+    };
+
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: t('editor.adjustments.actions.resetSectionSettings', {
+          section: t('modals.transform.title'),
+        }),
+        icon: RotateCcw,
+        onClick: handleResetTransform,
+      },
+    ]);
+  };
+
+  const handleLensContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const handleResetLens = async () => {
+      setLenses([]);
+      const defaults = await getOpenImageDefaults();
+      setAdjustments((prev: Adjustments) => ({
+        ...prev,
+        lensMaker: defaults.lensMaker,
+        lensModel: defaults.lensModel,
+        lensDistortionAmount: defaults.lensDistortionAmount,
+        lensVignetteAmount: defaults.lensVignetteAmount,
+        lensTcaAmount: defaults.lensTcaAmount,
+        lensDistortionEnabled: defaults.lensDistortionEnabled,
+        lensTcaEnabled: defaults.lensTcaEnabled,
+        lensVignetteEnabled: defaults.lensVignetteEnabled,
+        lensCorrectionMode: defaults.lensCorrectionMode,
+      }));
+    };
+
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: t('editor.adjustments.actions.resetSectionSettings', {
+          section: t('modals.lensCorrection.title'),
+        }),
+        icon: RotateCcw,
+        onClick: handleResetLens,
+      },
+    ]);
+  };
+
   return (
     <div className="flex flex-col h-full">
       <div className="p-3 flex justify-between items-center shrink-0 border-b border-surface">
@@ -464,7 +765,7 @@ export default function CropPanel() {
         </button>
       </div>
 
-      <div className="grow overflow-y-auto p-3 space-y-8">
+      <div className="grow overflow-y-auto p-3 space-y-6 custom-scrollbar">
         {selectedImage ? (
           <>
             <div className="space-y-4">
@@ -493,21 +794,42 @@ export default function CropPanel() {
                 </div>
               </Text>
               <div className="grid grid-cols-3 gap-2">
-                {PRESETS.map((preset: CropPreset) => (
-                  <motion.div
-                    className={clsx(
-                      'px-2 py-1.5 rounded-md transition-colors text-center cursor-pointer',
-                      isPresetActive(preset) ? 'bg-accent' : 'bg-surface hover:bg-card-active',
-                    )}
-                    key={preset.name}
-                    onClick={() => handlePresetClick(preset)}
-                    data-tooltip={preset.tooltip}
-                    whileTap={{ scale: 0.98 }}
-                    transition={{ type: 'spring', stiffness: 400, damping: 17 }}
-                  >
-                    <Text color={isPresetActive(preset) ? TextColors.button : TextColors.secondary}>{preset.name}</Text>
-                  </motion.div>
-                ))}
+                {ALL_PRESETS.map((preset: CropPreset, index: number) => {
+                  const savedIndex = index - PRESETS.length;
+                  return (
+                    <motion.div
+                      className={clsx(
+                        'relative group px-2 py-1.5 rounded-md transition-colors text-center cursor-pointer',
+                        isPresetActive(preset) ? 'bg-accent' : 'bg-surface hover:bg-card-active',
+                      )}
+                      key={savedIndex < 0 ? preset.name : `saved-${savedIndex}`}
+                      onClick={() => handlePresetClick(preset)}
+                      data-tooltip={
+                        preset.value === ORIGINAL_RATIO && originalDimensions
+                          ? `${preset.tooltip} (${formatRatioLabel(originalDimensions.width, originalDimensions.height)})`
+                          : preset.tooltip
+                      }
+                      whileTap={{ scale: 0.98 }}
+                      transition={{ type: 'spring', stiffness: 400, damping: 17 }}
+                    >
+                      <Text color={isPresetActive(preset) ? TextColors.button : TextColors.secondary}>
+                        {preset.name}
+                      </Text>
+                      {savedIndex >= 0 && (
+                        <button
+                          className="absolute -top-1 -right-1 z-10 p-0.5 rounded-full bg-card-active text-text-secondary opacity-0 group-hover:opacity-100 hover:bg-red-500/20 hover:text-red-500 transition-all"
+                          onClick={(e: React.MouseEvent) => {
+                            e.stopPropagation();
+                            handleRemoveSavedRatio(savedIndex);
+                          }}
+                          data-tooltip={t('editor.crop.custom.removeTooltip')}
+                        >
+                          <X size={10} />
+                        </button>
+                      )}
+                    </motion.div>
+                  );
+                })}
               </div>
               <div>
                 <motion.div
@@ -516,11 +838,11 @@ export default function CropPanel() {
                     isCustomActive ? 'bg-accent' : 'bg-surface hover:bg-card-active',
                   )}
                   onClick={() => {
-                    const imageRatio = getEffectiveOriginalRatio();
                     let newAspectRatio = BASE_RATIO;
-                    if (preferPortrait || (imageRatio && imageRatio < 1)) {
+                    if (preferPortrait || (originalRatio && originalRatio < 1)) {
                       newAspectRatio = 1 / BASE_RATIO;
                     }
+                    setIsCustomMode(true);
                     applyAspectRatio(newAspectRatio);
                   }}
                   data-tooltip={t('editor.crop.presets.custom.tooltip')}
@@ -565,6 +887,14 @@ export default function CropPanel() {
                       type="number"
                       value={customH}
                     />
+                    <button
+                      className="shrink-0 p-1.5 rounded-md text-text-secondary hover:bg-card-active hover:text-text-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      disabled={!appSettings || !customRatioToSave}
+                      onClick={handleSaveCustomRatio}
+                      data-tooltip={t('editor.crop.custom.saveTooltip')}
+                    >
+                      <Save size={16} />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -595,6 +925,14 @@ export default function CropPanel() {
                         <Ruler size={14} />
                       </button>
                       <button
+                        onClick={handleAutoStraighten}
+                        className="p-1.5 rounded-md text-text-secondary transition-colors cursor-pointer hover:bg-card-active hover:text-text-primary disabled:cursor-wait"
+                        data-tooltip={t('editor.crop.tooltips.autoStraighten')}
+                        disabled={isAutoStraightening}
+                      >
+                        {isAutoStraightening ? <Loader size={14} className="animate-spin" /> : <ScanLine size={14} />}
+                      </button>
+                      <button
                         className="p-1.5 rounded-md text-text-secondary transition-colors cursor-pointer hover:bg-card-active hover:text-text-primary"
                         onClick={resetFineRotation}
                         data-tooltip={t('editor.crop.tooltips.resetFineRotation')}
@@ -604,14 +942,15 @@ export default function CropPanel() {
                       </button>
                     </div>
                   }
-                  min={-45}
-                  max={45}
+                  min={-MAX_FINE_ROTATION}
+                  max={MAX_FINE_ROTATION}
                   step={0.1}
                   value={displayRotation}
                   defaultValue={0}
                   suffix="°"
                   onChange={handleFineRotationChange}
                   onDragStateChange={handleDragStateChange}
+                  speedEditId="rotation"
                 />
               </div>
             </div>
@@ -681,29 +1020,569 @@ export default function CropPanel() {
 
             <div className="space-y-4">
               <Text variant={TextVariants.heading} className="mb-2">
-                {t('editor.crop.geometryHeading')}
+                {t('modals.transform.title')}
               </Text>
-              <div className="grid grid-cols-2 gap-2">
-                <motion.div
-                  className="flex flex-col items-center justify-center p-3 cursor-pointer rounded-lg transition-colors bg-surface text-text-secondary hover:bg-card-active hover:text-text-primary group"
-                  onClick={() => setIsTransformModalOpen(true)}
-                  data-tooltip={t('editor.crop.tooltips.transform')}
-                  whileTap={{ scale: 0.98 }}
-                  transition={{ type: 'spring', stiffness: 400, damping: 17 }}
+              <div className="bg-surface rounded-xl overflow-hidden" onContextMenu={handleTransformContextMenu}>
+                <button
+                  onClick={() => toggleSection('transform')}
+                  className="w-full flex items-center justify-between p-4 text-text-secondary hover:text-text-primary hover:bg-card-active transition-colors"
                 >
-                  <Scan size={20} className="transition-none" />
-                  <span className="text-xs mt-2 transition-none">{t('editor.crop.labels.transform')}</span>
-                </motion.div>
-                <motion.div
-                  className="flex flex-col items-center justify-center p-3 cursor-pointer rounded-lg transition-colors bg-surface text-text-secondary hover:bg-card-active hover:text-text-primary group"
-                  onClick={() => setIsLensModalOpen(true)}
-                  data-tooltip={t('editor.crop.tooltips.lens')}
-                  whileTap={{ scale: 0.98 }}
-                  transition={{ type: 'spring', stiffness: 400, damping: 17 }}
+                  <Text as="span" variant={TextVariants.label} className="flex items-center gap-3">
+                    <Scan size={16} /> {t('modals.transform.geometry')}
+                  </Text>
+                  {isTransformExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                </button>
+
+                <AnimatePresence initial={false}>
+                  {isTransformExpanded && (
+                    <motion.div
+                      key="transform-accordion"
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{
+                        height: { duration: 0.35, ease: [0.25, 0.1, 0.25, 1] },
+                        opacity: { duration: 0.25, ease: 'easeOut' },
+                      }}
+                      style={{ overflow: 'hidden' }}
+                      className="overflow-hidden"
+                    >
+                      <div className="px-4 pb-4 pt-3 border-t border-surface/50 flex flex-col gap-6">
+                        <div>
+                          <Text variant={TextVariants.heading} className="mb-2">
+                            {t('modals.transform.guided')}
+                          </Text>
+                          <div className="space-y-3">
+                            <motion.button
+                              type="button"
+                              onClick={() => setEditor({ isGuidedPerspectiveActive: !isGuidedPerspectiveActive })}
+                              whileTap={{ scale: 0.98 }}
+                              transition={{ type: 'spring', stiffness: 400, damping: 17 }}
+                              className={clsx(
+                                'w-full flex items-center justify-center p-2.5 rounded-lg text-sm font-medium cursor-pointer transition-colors',
+                                isGuidedPerspectiveActive
+                                  ? 'bg-accent text-button-text group hover:bg-red-600 hover:text-white'
+                                  : 'bg-bg-secondary text-text-secondary hover:bg-card-active hover:text-text-primary',
+                              )}
+                            >
+                              {isGuidedPerspectiveActive ? (
+                                <>
+                                  <span className="flex items-center gap-2 group-hover:hidden">
+                                    <Cuboid size={16} />
+                                    {t('editor.guided.drawingActive')}
+                                  </span>
+                                  <span className="hidden items-center gap-2 group-hover:flex">
+                                    <Ban size={16} />
+                                    {t('editor.guided.cancel')}
+                                  </span>
+                                </>
+                              ) : (
+                                <span className="flex items-center gap-2">
+                                  <Cuboid size={16} />
+                                  {t('modals.transform.guided')}
+                                </span>
+                              )}
+                            </motion.button>
+
+                            {adjustments.guidedPerspective?.lines && adjustments.guidedPerspective.lines.length > 0 && (
+                              <div className="p-3 bg-bg-primary rounded-md border border-surface flex flex-col gap-2">
+                                <div className="flex justify-between items-center text-xs font-medium">
+                                  <span>{t('editor.guided.linesStatus')}</span>
+                                  <span
+                                    className={clsx(
+                                      adjustments.guidedPerspective.lines.length >= 2
+                                        ? 'text-accent'
+                                        : 'text-text-secondary',
+                                    )}
+                                  >
+                                    {`${adjustments.guidedPerspective.lines.length} / 4`}
+                                  </span>
+                                </div>
+                                <div className="flex flex-col gap-1 mt-1">
+                                  {adjustments.guidedPerspective.lines.map((line: any, idx: number) => (
+                                    <div
+                                      key={line.id}
+                                      className="flex items-center gap-2 p-2 rounded-md bg-surface transition-colors group"
+                                    >
+                                      <Text
+                                        as="div"
+                                        color={TextColors.secondary}
+                                        className="p-0.5 rounded transition-colors shrink-0 flex items-center justify-center"
+                                      >
+                                        <Minus size={16} />
+                                      </Text>
+                                      <div className="flex-1 min-w-0">
+                                        <Text
+                                          color={TextColors.primary}
+                                          weight={TextWeights.medium}
+                                          className="truncate select-none text-xs"
+                                        >
+                                          {t(
+                                            line.type === 'horizontal'
+                                              ? 'editor.guided.horizontalLine'
+                                              : 'editor.guided.verticalLine',
+                                            { index: idx + 1 },
+                                          )}
+                                        </Text>
+                                      </div>
+                                      <button
+                                        className="p-1 hover:text-red-500 text-text-secondary transition-colors"
+                                        onClick={() => {
+                                          const newLines = adjustments.guidedPerspective!.lines.filter(
+                                            (l: any) => l.id !== line.id,
+                                          );
+                                          setAdjustments((prev) => ({
+                                            ...prev,
+                                            guidedPerspective: {
+                                              ...prev.guidedPerspective,
+                                              lines: newLines,
+                                              enabled: newLines.length >= 2,
+                                            },
+                                          }));
+                                        }}
+                                      >
+                                        <Trash2 size={16} />
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div>
+                          <Text variant={TextVariants.heading} className="mb-2">
+                            {t('modals.transform.distortion')}
+                          </Text>
+                          <div className="space-y-3">
+                            <Slider
+                              resetKey="transformDistortion"
+                              label={t('modals.transform.amount')}
+                              step={1}
+                              value={adjustments.transformDistortion || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformDistortion: Number(e.target.value),
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <Text variant={TextVariants.heading} className="mb-2">
+                            {t('modals.transform.perspective')}
+                          </Text>
+                          <div className="space-y-3">
+                            <Slider
+                              resetKey="transformVertical"
+                              label={t('modals.transform.vertical')}
+                              step={1}
+                              value={adjustments.transformVertical || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformVertical: Number(e.target.value),
+                                }))
+                              }
+                            />
+                            <Slider
+                              resetKey="transformHorizontal"
+                              label={t('modals.transform.horizontal')}
+                              step={1}
+                              value={adjustments.transformHorizontal || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformHorizontal: Number(e.target.value),
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <Text variant={TextVariants.heading} className="mb-2">
+                            {t('modals.transform.title')}
+                          </Text>
+                          <div className="space-y-3">
+                            <Slider
+                              resetKey="transformRotate"
+                              label={t('modals.transform.rotate')}
+                              step={0.1}
+                              value={adjustments.transformRotate || 0}
+                              min={-45}
+                              max={45}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformRotate: Number(e.target.value),
+                                }))
+                              }
+                            />
+                            <Slider
+                              resetKey="transformAspect"
+                              label={t('modals.transform.aspect')}
+                              step={1}
+                              value={adjustments.transformAspect || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformAspect: Number(e.target.value),
+                                }))
+                              }
+                            />
+                            <Slider
+                              resetKey="transformScale"
+                              label={t('modals.transform.scale')}
+                              step={1}
+                              value={adjustments.transformScale || 100}
+                              min={50}
+                              max={150}
+                              defaultValue={100}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformScale: Number(e.target.value),
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <Text variant={TextVariants.heading} className="mb-2">
+                            {t('modals.transform.offset')}
+                          </Text>
+                          <div className="space-y-3">
+                            <Slider
+                              resetKey="transformXOffset"
+                              label={t('modals.transform.xAxis')}
+                              step={1}
+                              value={adjustments.transformXOffset || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformXOffset: Number(e.target.value),
+                                }))
+                              }
+                            />
+                            <Slider
+                              resetKey="transformYOffset"
+                              label={t('modals.transform.yAxis')}
+                              step={1}
+                              value={adjustments.transformYOffset || 0}
+                              min={-100}
+                              max={100}
+                              defaultValue={0}
+                              onChange={(e) =>
+                                setAdjustments((prev) => ({
+                                  ...prev,
+                                  transformYOffset: Number(e.target.value),
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <Text variant={TextVariants.heading} className="mb-2">
+                {t('modals.lensCorrection.title')}
+              </Text>
+              <div className="bg-surface rounded-xl overflow-hidden mb-6" onContextMenu={handleLensContextMenu}>
+                <button
+                  onClick={() => toggleSection('lens')}
+                  className="w-full flex items-center justify-between p-4 text-text-secondary hover:text-text-primary hover:bg-card-active transition-colors"
                 >
-                  <Aperture size={20} className="transition-none" />
-                  <span className="text-xs mt-2 transition-none">{t('editor.crop.labels.lens')}</span>
-                </motion.div>
+                  <Text as="span" variant={TextVariants.label} className="flex items-center gap-3">
+                    <Aperture size={16} /> {t('modals.lensCorrection.title')}
+                  </Text>
+                  {isLensExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                </button>
+
+                <AnimatePresence initial={false}>
+                  {isLensExpanded && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.25, ease: [0.4, 0, 0.2, 1] }}
+                      className="overflow-hidden"
+                    >
+                      <div className="px-4 pb-4 pt-2 border-t border-surface/50 flex flex-col gap-4">
+                        <div className="w-full p-1 bg-card-active rounded-md">
+                          <div className="relative flex w-full">
+                            <motion.div
+                              className="absolute top-0 bottom-0 z-0 bg-accent"
+                              style={{ borderRadius: 6 }}
+                              animate={modeBubbleStyle}
+                              transition={{ type: 'spring', bounce: 0.2, duration: 0.6 }}
+                            />
+                            <button
+                              onClick={() => handleModeChange('auto')}
+                              className={clsx(
+                                'relative flex-1 flex items-center justify-center gap-2 px-3 p-1.5 text-sm font-medium rounded-md transition-colors',
+                                lensMode === 'auto' ? 'text-button-text' : 'text-text-primary hover:bg-surface/50',
+                              )}
+                              style={{ WebkitTapHighlightColor: 'transparent' }}
+                            >
+                              <span className="relative z-10 flex items-center">
+                                {t('modals.lensCorrection.modeAuto')}
+                              </span>
+                            </button>
+                            <button
+                              onClick={() => handleModeChange('manual')}
+                              className={clsx(
+                                'relative flex-1 flex items-center justify-center gap-2 px-3 p-1.5 text-sm font-medium rounded-md transition-colors',
+                                lensMode === 'manual' ? 'text-button-text' : 'text-text-primary hover:bg-surface/50',
+                              )}
+                              style={{ WebkitTapHighlightColor: 'transparent' }}
+                            >
+                              <span className="relative z-10 flex items-center">
+                                {t('modals.lensCorrection.modeManual')}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {lensMode === 'auto' ? (
+                          <div
+                            className={clsx(
+                              'w-full flex items-center justify-center gap-2 p-3 text-sm rounded-md border transition-colors',
+                              lensInfo === null
+                                ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                                : lensInfo
+                                  ? 'bg-green-500/10 text-green-400 border-green-500/20'
+                                  : 'bg-bg-primary border-surface text-text-secondary',
+                            )}
+                          >
+                            {lensInfo === undefined ? (
+                              <>
+                                <Loader size={16} className="animate-spin" /> {t('modals.lensCorrection.detectingExif')}
+                              </>
+                            ) : lensInfo === null ? (
+                              t('modals.lensCorrection.lensProfileNotFound')
+                            ) : (
+                              <>
+                                <Check size={16} /> {lensInfo.maker} - {lensInfo.model}
+                              </>
+                            )}
+                          </div>
+                        ) : (
+                          <>
+                            <Dropdown
+                              options={myLensOptions}
+                              value=""
+                              onChange={handleMyLensSelect}
+                              placeholder={t('modals.lensCorrection.chooseSavedLens')}
+                            />
+                            <Dropdown
+                              options={makers.map((m) => ({ label: m, value: m }))}
+                              value={adjustments.lensMaker || ''}
+                              onChange={handleMakerChange}
+                              placeholder={t('modals.lensCorrection.selectManufacturer')}
+                            />
+                            {adjustments.lensMaker && (
+                              <Dropdown
+                                options={lenses.map((l) => ({ label: l, value: l }))}
+                                value={adjustments.lensModel || ''}
+                                onChange={handleModelChange}
+                                placeholder={t('modals.lensCorrection.selectLensModel')}
+                              />
+                            )}
+                          </>
+                        )}
+
+                        <div className="flex flex-col gap-3 mt-2">
+                          <div
+                            className={clsx(
+                              'bg-bg-primary p-3 rounded-md border border-surface transition-colors',
+                              hasDistortion ? '' : 'opacity-50 grayscale',
+                            )}
+                          >
+                            <div className="flex items-center gap-3">
+                              <SquareDashed size={16} className="text-text-secondary shrink-0" />
+                              <Switch
+                                className="grow"
+                                label={t('modals.lensCorrection.distortion')}
+                                disabled={!hasDistortion}
+                                checked={(adjustments.lensDistortionEnabled ?? true) && hasDistortion}
+                                onChange={(v) => setAdjustments((prev) => ({ ...prev, lensDistortionEnabled: v }))}
+                              />
+                            </div>
+                            <AnimatePresence initial={false}>
+                              {hasDistortion && (adjustments.lensDistortionEnabled ?? true) && (
+                                <motion.div
+                                  initial={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  animate={{ height: 'auto', opacity: 1, marginTop: 16 }}
+                                  exit={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  className="px-2 overflow-hidden"
+                                >
+                                  <Slider
+                                    resetKey="lensDistortionAmount"
+                                    label={t('modals.lensCorrection.amount')}
+                                    step={1}
+                                    value={adjustments.lensDistortionAmount ?? 100}
+                                    min={0}
+                                    max={200}
+                                    defaultValue={100}
+                                    onChange={(e) =>
+                                      setAdjustments((prev) => ({
+                                        ...prev,
+                                        lensDistortionAmount: Number(e.target.value),
+                                      }))
+                                    }
+                                  />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+
+                          <div
+                            className={clsx(
+                              'bg-bg-primary p-3 rounded-md border border-surface transition-colors',
+                              hasTca ? '' : 'opacity-50 grayscale',
+                            )}
+                          >
+                            <div className="flex items-center gap-3">
+                              <Activity size={16} className="text-text-secondary shrink-0" />
+                              <Switch
+                                className="grow"
+                                label={t('modals.lensCorrection.chromaticAberration')}
+                                disabled={!hasTca}
+                                checked={(adjustments.lensTcaEnabled ?? true) && hasTca}
+                                onChange={(v) => setAdjustments((prev) => ({ ...prev, lensTcaEnabled: v }))}
+                              />
+                            </div>
+                            <AnimatePresence initial={false}>
+                              {hasTca && (adjustments.lensTcaEnabled ?? true) && (
+                                <motion.div
+                                  initial={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  animate={{ height: 'auto', opacity: 1, marginTop: 16 }}
+                                  exit={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  className="px-2 overflow-hidden"
+                                >
+                                  <Slider
+                                    resetKey="lensTcaAmount"
+                                    label={t('modals.lensCorrection.amount')}
+                                    step={1}
+                                    value={adjustments.lensTcaAmount ?? 100}
+                                    min={0}
+                                    max={200}
+                                    defaultValue={100}
+                                    onChange={(e) =>
+                                      setAdjustments((prev) => ({
+                                        ...prev,
+                                        lensTcaAmount: Number(e.target.value),
+                                      }))
+                                    }
+                                  />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+
+                          <div
+                            className={clsx(
+                              'bg-bg-primary p-3 rounded-md border border-surface transition-colors',
+                              hasVignetting ? '' : 'opacity-50 grayscale',
+                            )}
+                          >
+                            <div className="flex items-center gap-3">
+                              <CircleDashed size={16} className="text-text-secondary shrink-0" />
+                              <Switch
+                                className="grow"
+                                label={t('modals.lensCorrection.vignetting')}
+                                disabled={!hasVignetting}
+                                checked={(adjustments.lensVignetteEnabled ?? true) && hasVignetting}
+                                onChange={(v) => setAdjustments((prev) => ({ ...prev, lensVignetteEnabled: v }))}
+                              />
+                            </div>
+                            <AnimatePresence initial={false}>
+                              {hasVignetting && (adjustments.lensVignetteEnabled ?? true) && (
+                                <motion.div
+                                  initial={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  animate={{ height: 'auto', opacity: 1, marginTop: 16 }}
+                                  exit={{ height: 0, opacity: 0, marginTop: 0 }}
+                                  className="px-2 overflow-hidden"
+                                >
+                                  <Slider
+                                    resetKey="lensVignetteAmount"
+                                    label={t('modals.lensCorrection.amount')}
+                                    step={1}
+                                    value={adjustments.lensVignetteAmount ?? 100}
+                                    min={0}
+                                    max={200}
+                                    defaultValue={100}
+                                    onChange={(e) =>
+                                      setAdjustments((prev) => ({
+                                        ...prev,
+                                        lensVignetteAmount: Number(e.target.value),
+                                      }))
+                                    }
+                                  />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+                        </div>
+
+                        <Text
+                          as="div"
+                          variant={TextVariants.small}
+                          className="p-3 mt-2 bg-bg-primary rounded-md border border-surface flex items-start gap-3"
+                        >
+                          <Info size={16} className="shrink-0 mt-0.5" />
+                          <div className="leading-tight space-y-1">
+                            <Trans
+                              i18nKey="modals.lensCorrection.databaseNotice"
+                              components={[
+                                <a
+                                  key="0"
+                                  href="https://lensfun.github.io/"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="underline hover:text-primary transition-colors"
+                                />,
+                                <a
+                                  key="1"
+                                  href="https://creativecommons.org/licenses/by-sa/3.0/"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="underline hover:text-primary transition-colors"
+                                />,
+                              ]}
+                            />
+                          </div>
+                        </Text>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </div>
           </>
@@ -720,31 +1599,6 @@ export default function CropPanel() {
           </div>
         )}
       </div>
-
-      <TransformModal
-        isOpen={isTransformModalOpen}
-        onClose={() => setIsTransformModalOpen(false)}
-        onApply={(newAdjustments) => {
-          setAdjustments((prev: Adjustments) => ({
-            ...prev,
-            ...newAdjustments,
-          }));
-        }}
-        currentAdjustments={adjustments}
-      />
-
-      <LensCorrectionModal
-        isOpen={isLensModalOpen}
-        onClose={() => setIsLensModalOpen(false)}
-        onApply={(newParams) => {
-          setAdjustments((prev: Adjustments) => ({
-            ...prev,
-            ...newParams,
-          }));
-        }}
-        currentAdjustments={adjustments}
-        selectedImage={selectedImage}
-      />
     </div>
   );
 }

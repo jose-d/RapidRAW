@@ -7,7 +7,6 @@ import {
   Star as StarIcon,
   ZoomIn,
   ZoomOut,
-  Maximize,
   Link,
   SquarePen,
   Tag,
@@ -19,7 +18,11 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import clsx from 'clsx';
-import { Invokes, ImageFile } from '../../ui/AppProperties';
+import { Invokes } from '../../../types/invokes';
+import { ImageFile, ImageFlag } from '../../../types/library';
+import { ThumbnailAspectRatio } from '../../../types/settings';
+import FlagToggles from './FlagToggles';
+import FlagBadges from './FlagBadges';
 import { Thumbnail } from './LibraryItems';
 import Text from '../../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../../types/typography';
@@ -30,6 +33,8 @@ import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import { expandGroupedPaths } from '../../../utils/imageGrouping';
 import { IconAperture, IconFocalLength, IconIso, IconShutter } from '../editor/ExifIcons';
+
+const NOOP = () => {};
 
 interface SyncViewport {
   isActive: boolean;
@@ -72,7 +77,7 @@ function CullingPreview({
   setShowInfoBar: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
   const { t } = useTranslation();
-  const thumbUrl = useProcessStore((s) => s.thumbnails[image.path]);
+  const thumbUrl = useProcessStore((s) => s.mediumThumbnails[image.path] || s.thumbnails[image.path]);
   const initialPreview = useProcessStore((s) => s.previews[image.path]);
   const setPreview = useProcessStore((s) => s.setPreview);
   const safeThumbKey = thumbUrl || '';
@@ -92,7 +97,7 @@ function CullingPreview({
   const panRef = useRef(pan);
   const [tagInputValue, setTagInputValue] = useState('');
   const [fitScale, setFitScale] = useState<number | null>(null);
-  const { handleRate, handleSetColorLabel, handleTagsChanged } = useLibraryActions();
+  const { handleRate, handleToggleFlag, handleSetColorLabel, handleTagsChanged } = useLibraryActions();
   const USER_TAG_PREFIX = 'user:';
   const getPathsToUpdate = () =>
     expandGroupedPaths(
@@ -111,7 +116,8 @@ function CullingPreview({
 
   const displayEditIcon = useSettingsStore((s) => s.appSettings?.displayEditIcon ?? true);
   const showEditIcon = image.is_edited && displayEditIcon;
-  const hasAnyOverlay = showEditIcon || !!colorLabel || rating > 0;
+  const hasRating = rating > 0 && image.flag !== ImageFlag.Reject;
+  const hasAnyOverlay = showEditIcon || !!colorLabel || hasRating || !!image.flag;
 
   const currentTags = useMemo(() => {
     return (image.tags || [])
@@ -123,8 +129,9 @@ function CullingPreview({
       .sort((a, b) => a.tag.localeCompare(b.tag));
   }, [image.tags]);
 
+  const imageExif = useLibraryStore((s) => s.exifByPath[image.path]);
   const { exifData, hasExif } = useMemo(() => {
-    const exif = image.exif || {};
+    const exif = imageExif || {};
 
     let fNum = exif.FNumber;
     if (fNum) {
@@ -159,10 +166,10 @@ function CullingPreview({
       exifData: data,
       hasExif: hasData,
     };
-  }, [image.exif]);
+  }, [imageExif]);
 
-  const imageWidth = (image as any).width || image.exif?.ExifImageWidth || image.exif?.PixelXDimension;
-  const imageHeight = (image as any).height || image.exif?.ExifImageHeight || image.exif?.PixelYDimension;
+  const imageWidth = (image as any).width || imageExif?.ExifImageWidth || imageExif?.PixelXDimension;
+  const imageHeight = (image as any).height || imageExif?.ExifImageHeight || imageExif?.PixelYDimension;
 
   const handleAddTag = async (tagToAdd: string) => {
     const newTagValue = tagToAdd.trim().toLowerCase();
@@ -254,8 +261,7 @@ function CullingPreview({
         const metadata: any = await invoke(Invokes.LoadMetadata, { path: image.path });
         if (!active) return;
 
-        const adjustments =
-          metadata && metadata.adjustments && !metadata.adjustments.is_null ? metadata.adjustments : {};
+        const adjustments = metadata?.adjustments ?? null;
 
         const bytes = await invoke<Uint8Array>(Invokes.GeneratePreviewForPath, {
           path: image.path,
@@ -279,7 +285,7 @@ function CullingPreview({
           try {
             const fallbackBytes = await invoke<Uint8Array>(Invokes.GeneratePreviewForPath, {
               path: image.path,
-              jsAdjustments: {},
+              jsAdjustments: null,
             });
             if (!active) return;
             const blob = new Blob([new Uint8Array(fallbackBytes)], { type: 'image/jpeg' });
@@ -540,7 +546,7 @@ function CullingPreview({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 10, scale: 0.95 }}
             transition={{ duration: 0.15 }}
-            className="absolute bottom-[4.5rem] left-1/2 -translate-x-1/2 flex flex-col gap-4 bg-bg-primary/70 backdrop-blur-md p-4 rounded-xl border border-white/10 shadow-xl z-30 pointer-events-auto w-64 max-h-[70%] overflow-y-auto custom-scrollbar"
+            className="absolute bottom-[5.75rem] left-1/2 -translate-x-1/2 flex flex-col gap-4 bg-bg-primary/70 backdrop-blur-md p-4 rounded-xl border border-white/10 shadow-xl z-30 pointer-events-auto w-64 max-h-[70%] overflow-y-auto custom-scrollbar"
             onMouseDown={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
@@ -639,7 +645,7 @@ function CullingPreview({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 10, scale: 0.95 }}
             transition={{ duration: 0.15 }}
-            className="absolute bottom-[4.5rem] left-1/2 -translate-x-1/2 flex flex-col gap-4 bg-bg-primary/70 backdrop-blur-md p-4 rounded-xl border border-white/10 shadow-xl z-30 pointer-events-auto w-64 max-h-[70%] overflow-y-auto custom-scrollbar"
+            className="absolute bottom-[5.75rem] left-1/2 -translate-x-1/2 flex flex-col gap-4 bg-bg-primary/70 backdrop-blur-md p-4 rounded-xl border border-white/10 shadow-xl z-30 pointer-events-auto w-64 max-h-[70%] overflow-y-auto custom-scrollbar"
             onMouseDown={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
@@ -681,6 +687,12 @@ function CullingPreview({
                     />
                   </button>
                 ))}
+                <div className="w-px h-4 bg-white/20 mx-1" />
+                <FlagToggles
+                  flag={image.flag}
+                  onToggle={(flag) => handleToggleFlag(flag, [image.path])}
+                  inactiveClassName="text-white/30 hover:text-white/80"
+                />
               </div>
             </div>
 
@@ -779,149 +791,155 @@ function CullingPreview({
 
       <div
         className={clsx(
-          'absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-bg-primary/70 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10 shadow-xl z-20 pointer-events-auto transition-opacity duration-200 max-w-[calc(100%-1.5rem)]',
+          'absolute bottom-4 left-1/2 -translate-x-1/2 flex flex-col bg-bg-primary/70 backdrop-blur-md rounded-xl border border-white/10 shadow-xl overflow-hidden z-20 pointer-events-auto transition-opacity duration-200 max-w-[calc(100%-1.5rem)]',
           isRateMenuVisible || isInfoMenuVisible ? 'opacity-100' : 'opacity-0 group-hover:opacity-100',
         )}
         onMouseDown={(e) => e.stopPropagation()}
         onWheel={(e) => e.stopPropagation()}
       >
-        <AnimatePresence>
-          {isLoading && (
-            <motion.div
-              initial={{ opacity: 0, width: 0 }}
-              animate={{ opacity: 1, width: 'auto' }}
-              exit={{ opacity: 0, width: 0 }}
-              className="flex items-center justify-center overflow-hidden"
-            >
-              <Loader2 className="w-4 h-4 animate-spin text-white mr-1" />
-            </motion.div>
+        <div className="flex items-center gap-2 px-3 py-1.5 min-w-0">
+          <AnimatePresence>
+            {isLoading && (
+              <motion.div
+                initial={{ opacity: 0, width: 0 }}
+                animate={{ opacity: 1, width: 'auto' }}
+                exit={{ opacity: 0, width: 0 }}
+                className="flex items-center justify-center overflow-hidden"
+              >
+                <Loader2 className="w-4 h-4 animate-spin text-white mr-1" />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <Text
+            variant={TextVariants.small}
+            className="text-white truncate shrink min-w-0 max-w-20 sm:max-w-28 md:max-w-37.5"
+            data-tooltip={baseName}
+          >
+            {baseName}
+          </Text>
+
+          {isVirtualCopy && (
+            <div className="bg-white/20 text-white px-1.5 py-0.5 rounded-sm shrink-0 ml-1">
+              <Text variant={TextVariants.small} weight={TextWeights.bold} className="text-[9px] leading-none">
+                {t('library.culling.vc')}
+              </Text>
+            </div>
           )}
-        </AnimatePresence>
 
-        <Text
-          variant={TextVariants.small}
-          className="text-white truncate shrink min-w-0 max-w-20 sm:max-w-28 md:max-w-37.5"
-          data-tooltip={baseName}
-        >
-          {baseName}
-        </Text>
+          {hasAnyOverlay && (
+            <div className="rounded-full h-5 px-1.5 flex items-center justify-center gap-0 shadow-md bg-surface/30 pointer-events-auto shrink-0 ml-1">
+              {showEditIcon && (
+                <div className="text-white flex items-center shrink-0">
+                  <SlidersHorizontal size={12} />
+                </div>
+              )}
 
-        {isVirtualCopy && (
-          <div className="bg-white/20 text-white px-1.5 py-0.5 rounded-sm shrink-0 ml-1">
-            <Text variant={TextVariants.small} weight={TextWeights.bold} className="text-[9px] leading-none">
-              {t('library.culling.vc')}
-            </Text>
-          </div>
-        )}
+              {colorLabel && (
+                <div className={clsx('flex items-center justify-center shrink-0', showEditIcon && 'ml-1.5')}>
+                  <div
+                    className="w-3 h-3 rounded-full transition-colors duration-200"
+                    style={{ backgroundColor: colorLabel.color }}
+                  />
+                </div>
+              )}
 
-        {hasAnyOverlay && (
-          <div className="rounded-full h-5 px-1.5 flex items-center justify-center gap-0 shadow-md bg-surface/30 pointer-events-auto shrink-0 ml-1">
-            {showEditIcon && (
-              <div className="text-white flex items-center shrink-0">
-                <SlidersHorizontal size={12} />
-              </div>
+              {hasRating && (
+                <div className={clsx('flex items-center gap-0.5 shrink-0', (showEditIcon || colorLabel) && 'ml-1.5')}>
+                  <Text variant={TextVariants.small} color={TextColors.white}>
+                    {rating}
+                  </Text>
+                  <StarIcon size={12} className="text-white fill-white" />
+                </div>
+              )}
+
+              <FlagBadges flag={image.flag} hasPrecedingBadge={!!showEditIcon || !!colorLabel || hasRating} />
+            </div>
+          )}
+
+          <div className="w-px h-5 bg-white/20 mx-1 shrink-0"></div>
+
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowInfoBar((prev) => {
+                if (!prev) setShowRateBar(false);
+                return !prev;
+              });
+            }}
+            className={clsx(
+              'p-1.5 rounded-full transition-colors shrink-0',
+              showInfoBar ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
             )}
+            data-tooltip={t('library.culling.metadata')}
+          >
+            <Info size={14} />
+          </button>
 
-            {colorLabel && (
-              <div className={clsx('flex items-center justify-center shrink-0', showEditIcon && 'ml-1.5')}>
-                <div
-                  className="w-3 h-3 rounded-full transition-colors duration-200"
-                  style={{ backgroundColor: colorLabel.color }}
-                />
-              </div>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowRateBar((prev) => {
+                if (!prev) setShowInfoBar(false);
+                return !prev;
+              });
+            }}
+            className={clsx(
+              'p-1.5 rounded-full transition-colors shrink-0',
+              showRateBar ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
             )}
+            data-tooltip={t('library.culling.rateAndLabel')}
+          >
+            <Tag size={14} />
+          </button>
 
-            {rating > 0 && (
-              <div className={clsx('flex items-center gap-0.5 shrink-0', (showEditIcon || colorLabel) && 'ml-1.5')}>
-                <Text variant={TextVariants.small} color={TextColors.white}>
-                  {rating}
-                </Text>
-                <StarIcon size={12} className="text-white fill-white" />
-              </div>
+          <div className="w-px h-5 bg-white/20 mx-1 shrink-0"></div>
+
+          <button
+            onClick={toggleSync}
+            className={clsx(
+              'p-1.5 rounded-full transition-colors shrink-0',
+              syncViewport.isActive ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
             )}
-          </div>
-        )}
+            data-tooltip={t('library.culling.syncZoomAndPan')}
+          >
+            <Link size={14} />
+          </button>
 
-        <div className="w-px h-5 bg-white/20 mx-1 shrink-0"></div>
+          <button
+            onClick={handleZoomOut}
+            className="p-1.5 text-white/60 hover:bg-white/10 hover:text-white rounded-full transition-colors shrink-0"
+          >
+            <ZoomOut size={16} />
+          </button>
+
+          <button
+            onClick={handleToggle1to1}
+            className="text-xs font-mono text-white/90 w-8 text-center select-none shrink-0 hover:bg-white/10 hover:text-white rounded-md py-1 transition-colors cursor-pointer"
+            data-tooltip={t('library.culling.toggleFit')}
+          >
+            {fitScale ? Math.round(zoom * fitScale * 100) : Math.round(zoom * 100)}%
+          </button>
+
+          <button
+            onClick={handleZoomIn}
+            className="p-1.5 text-white/60 hover:bg-white/10 hover:text-white rounded-full transition-colors shrink-0"
+          >
+            <ZoomIn size={16} />
+          </button>
+        </div>
+
+        <div className="h-px mx-3 bg-white/10 shrink-0" />
 
         <button
           onClick={(e) => {
             e.stopPropagation();
             onImageDoubleClick(image.path);
           }}
-          className="p-1.5 text-white/60 hover:bg-white/10 hover:text-white rounded-full transition-colors shrink-0"
-          data-tooltip={t('library.culling.editImage')}
+          className="flex items-center justify-center gap-1.5 w-full px-3 py-1.5 text-white/60 hover:bg-white/10 hover:text-white transition-colors"
         >
-          <SquarePen size={14} />
-        </button>
-
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowInfoBar((prev) => {
-              if (!prev) setShowRateBar(false);
-              return !prev;
-            });
-          }}
-          className={clsx(
-            'p-1.5 rounded-full transition-colors shrink-0',
-            showInfoBar ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
-          )}
-          data-tooltip={t('library.culling.metadata')}
-        >
-          <Info size={14} />
-        </button>
-
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowRateBar((prev) => {
-              if (!prev) setShowInfoBar(false);
-              return !prev;
-            });
-          }}
-          className={clsx(
-            'p-1.5 rounded-full transition-colors shrink-0',
-            showRateBar ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
-          )}
-          data-tooltip={t('library.culling.rateAndLabel')}
-        >
-          <Tag size={14} />
-        </button>
-
-        <div className="w-px h-5 bg-white/20 mx-1 shrink-0"></div>
-
-        <button
-          onClick={toggleSync}
-          className={clsx(
-            'p-1.5 rounded-full transition-colors shrink-0',
-            syncViewport.isActive ? 'bg-accent text-button-text' : 'text-white/60 hover:bg-white/10 hover:text-white',
-          )}
-          data-tooltip={t('library.culling.syncZoomAndPan')}
-        >
-          <Link size={14} />
-        </button>
-
-        <button
-          onClick={handleZoomOut}
-          className="p-1.5 text-white/60 hover:bg-white/10 hover:text-white rounded-full transition-colors shrink-0"
-        >
-          <ZoomOut size={16} />
-        </button>
-
-        <button
-          onClick={handleToggle1to1}
-          className="text-xs font-mono text-white/90 w-8 text-center select-none shrink-0 hover:bg-white/10 hover:text-white rounded-md py-1 transition-colors cursor-pointer"
-          data-tooltip={t('library.culling.toggleFit')}
-        >
-          {fitScale ? Math.round(zoom * fitScale * 100) : Math.round(zoom * 100)}%
-        </button>
-
-        <button
-          onClick={handleZoomIn}
-          className="p-1.5 text-white/60 hover:bg-white/10 hover:text-white rounded-full transition-colors shrink-0"
-        >
-          <ZoomIn size={16} />
+          <span className="text-xs truncate">{t('contextMenus.editor.editImage')}</span>
+          <SquarePen size={12} className="shrink-0" />
         </button>
       </div>
 
@@ -935,60 +953,61 @@ function CullingPreview({
   );
 }
 
-const Row = React.memo(
-  ({
-    index,
-    style,
-    imageList,
-    multiSelectedPaths,
-    activePath,
-    onContextMenu,
-    onImageDoubleClick,
-    thumbnailAspectRatio,
-    imageRatings,
-    onImageClick,
-    queueThumbnailRequest,
-    hoveredCullingPath,
-  }: any) => {
-    const image: ImageFile = imageList[index];
-    const isSelected = multiSelectedPaths.includes(image.path);
+const Row = ({
+  index,
+  style,
+  imageList,
+  multiSelectedPaths,
+  activePath,
+  onContextMenu,
+  onImageDoubleClick,
+  thumbnailAspectRatio,
+  imageRatings,
+  onImageClick,
+  queueThumbnailRequest,
+  hoveredCullingPath,
+}: any) => {
+  const image: ImageFile = imageList[index];
+  const isSelected = multiSelectedPaths.includes(image.path);
+  const imagePath = image?.path;
+  const isCloudPlaceholder = !!image?.is_cloud_placeholder;
 
-    useEffect(() => {
-      if (!image || !queueThumbnailRequest) return;
-      queueThumbnailRequest(image.path);
+  useEffect(() => {
+    if (!image || !queueThumbnailRequest) return;
+    queueThumbnailRequest(image.path);
+  }, [image, queueThumbnailRequest]);
 
-      if (image.is_cloud_placeholder) {
-        const interval = setInterval(() => {
-          queueThumbnailRequest(image.path);
-        }, 5000);
-        return () => clearInterval(interval);
-      }
-    }, [image, queueThumbnailRequest]);
+  useEffect(() => {
+    if (!imagePath || !isCloudPlaceholder || !queueThumbnailRequest) return;
+    const interval = setInterval(() => {
+      queueThumbnailRequest(imagePath);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [imagePath, isCloudPlaceholder, queueThumbnailRequest]);
 
-    return (
-      <div style={style} className="p-2 box-border">
-        <div className="w-full h-full">
-          <Thumbnail
-            path={image.path}
-            isSelected={isSelected}
-            isActive={activePath === image.path}
-            isForcedHover={hoveredCullingPath === image.path}
-            onImageClick={(path: string, e: any) => onImageClick(path, e)}
-            onContextMenu={onContextMenu}
-            onImageDoubleClick={onImageDoubleClick}
-            onLoad={() => {}}
-            rating={imageRatings?.[image.path] || 0}
-            tags={image.tags}
-            exif={image.exif}
-            isEdited={image.is_edited}
-            aspectRatio={thumbnailAspectRatio}
-            isCloudPlaceholder={image.is_cloud_placeholder}
-          />
-        </div>
+  return (
+    <div style={style} className="p-2 box-border">
+      <div className="w-full h-full">
+        <Thumbnail
+          path={image.path}
+          isSelected={isSelected}
+          isActive={activePath === image.path}
+          isForcedHover={hoveredCullingPath === image.path}
+          onImageClick={onImageClick}
+          onContextMenu={onContextMenu}
+          onImageDoubleClick={onImageDoubleClick}
+          onLoad={NOOP}
+          rating={imageRatings?.[image.path] || 0}
+          flag={image.flag}
+          tags={image.tags}
+          isEdited={image.is_edited}
+          aspectRatio={thumbnailAspectRatio}
+          isCloudPlaceholder={image.is_cloud_placeholder}
+        />
       </div>
-    );
-  },
-);
+    </div>
+  );
+};
 
 export default function CullingView(props: any) {
   const { t } = useTranslation();
@@ -1090,6 +1109,15 @@ export default function CullingView(props: any) {
     [onRequestThumbnails],
   );
 
+  useEffect(
+    () => () => {
+      if (requestTimeoutRef.current) clearTimeout(requestTimeoutRef.current);
+      requestTimeoutRef.current = null;
+      requestQueueRef.current.clear();
+    },
+    [],
+  );
+
   useEffect(() => {
     const updateHeight = () => {
       if (containerRef.current) {
@@ -1132,12 +1160,15 @@ export default function CullingView(props: any) {
     };
   }, [resize, stopResizing]);
 
+  const effectiveAspectRatio =
+    thumbnailAspectRatio === ThumbnailAspectRatio.Justified ? ThumbnailAspectRatio.Contain : thumbnailAspectRatio;
+
   const rowProps = useMemo(
     () => ({
       imageList,
       multiSelectedPaths,
       activePath,
-      thumbnailAspectRatio,
+      thumbnailAspectRatio: effectiveAspectRatio,
       imageRatings,
       onContextMenu,
       onImageDoubleClick,
@@ -1150,7 +1181,7 @@ export default function CullingView(props: any) {
       imageList,
       multiSelectedPaths,
       activePath,
-      thumbnailAspectRatio,
+      effectiveAspectRatio,
       imageRatings,
       onContextMenu,
       onImageDoubleClick,
@@ -1190,6 +1221,7 @@ export default function CullingView(props: any) {
               {t('library.culling.selectImagesToCompare')}
             </Text>
             <Text className="mt-2 text-text-secondary">{t('library.culling.clickThumbnailsHint')}</Text>
+            <Text className="mt-1 text-text-secondary">{t('library.culling.doubleClickToEditHint')}</Text>
           </div>
         ) : (
           <div

@@ -1,17 +1,26 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { homeDir } from '@tauri-apps/api/path';
+import { dirname, homeDir } from '@tauri-apps/api/path';
 import { toast } from 'react-toastify';
 import { useLibraryStore } from '../store/useLibraryStore';
-import { useEditorStore } from '../store/useEditorStore';
+import { canvasToolState, useEditorStore } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
-import { Invokes, LibraryViewMode, ImageFile } from '../components/ui/AppProperties';
-import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import { Invokes } from '../types/invokes';
+import { LibraryViewMode } from '../types/settings';
+import { ImageFile } from '../types/library';
+import { INITIAL_ADJUSTMENTS } from '../utils/adjustments';
+import { adjustmentsFromMetadata } from '../utils/developDefaults';
+import { isSameValue } from '../utils/editHistory';
 import { globalImageCache } from '../utils/ImageLRUCache';
+import { decodeImage } from '../utils/decodeImage';
 import { debouncedSave, debouncedSetHistory } from './useEditorActions';
+import { notifyEmbeddedPreview } from './useImageLoader';
+import { clearLibrarySelection } from './useLibraryActions';
+import { computeSortedLibrary } from './useSortedLibrary';
+import { getImmichAlbumImages, isImmichAlbumId } from '../utils/immichApi';
 
 export interface AppNavigationProps {
   clearThumbnailQueue: () => void;
@@ -27,6 +36,77 @@ export interface AppNavigationProps {
     prevAdjustmentsRef: React.RefObject<any>;
   };
 }
+
+let exifLoadGeneration = 0;
+let imageSelectGeneration = 0;
+
+const EXIF_CHUNK_SIZE = 250;
+
+const loadExifForImages = async (
+  files: ImageFile[],
+  expectedFolderPath: string | null,
+  sortKey: string,
+  setLibrary: (updater: any) => void,
+) => {
+  const exifSortKeys = ['date_taken', 'iso', 'shutter_speed', 'aperture', 'focal_length'];
+  const isExifSortActive = exifSortKeys.includes(sortKey);
+  const generation = ++exifLoadGeneration;
+
+  const previousExif = useLibraryStore.getState().exifByPath;
+  const knownExif: Record<string, Record<string, string>> = {};
+  for (const file of files) {
+    const exif = previousExif[file.path] || file.exif;
+    if (exif) knownExif[file.path] = exif;
+  }
+
+  if (files.length === 0) {
+    setLibrary({ imageList: files, exifByPath: knownExif });
+    return;
+  }
+
+  const paths = files.map((f: ImageFile) => f.path);
+
+  if (isExifSortActive) {
+    for (let i = 0; i < paths.length; i += EXIF_CHUNK_SIZE) {
+      const chunk = paths.slice(i, i + EXIF_CHUNK_SIZE);
+      try {
+        const chunkExif: Record<string, Record<string, string>> = await invoke(Invokes.ReadExifForPaths, {
+          paths: chunk,
+        });
+        Object.assign(knownExif, chunkExif);
+      } catch (err) {
+        console.error('Failed to read EXIF chunk:', err);
+      }
+    }
+
+    if (generation !== exifLoadGeneration) return;
+    setLibrary({ imageList: files, exifByPath: knownExif });
+  } else {
+    setLibrary({ imageList: files, exifByPath: knownExif });
+
+    setTimeout(() => {
+      const fetchExifInChunks = async () => {
+        for (let i = 0; i < paths.length; i += EXIF_CHUNK_SIZE) {
+          if (generation !== exifLoadGeneration) break;
+          if (useLibraryStore.getState().currentFolderPath !== expectedFolderPath) break;
+
+          const chunk = paths.slice(i, i + EXIF_CHUNK_SIZE);
+          try {
+            const chunkExif: Record<string, Record<string, string>> = await invoke(Invokes.ReadExifForPaths, {
+              paths: chunk,
+            });
+            if (generation !== exifLoadGeneration) break;
+            setLibrary((state: any) => ({ exifByPath: { ...state.exifByPath, ...chunkExif } }));
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          } catch (err) {
+            console.error('Failed to read EXIF chunk:', err);
+          }
+        }
+      };
+      fetchExifInChunks();
+    }, 500);
+  }
+};
 
 export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationProps) {
   const {
@@ -74,19 +154,30 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     });
 
     debouncedSave.flush();
-    debouncedSetHistory.cancel();
+    debouncedSetHistory.flush();
 
     const lastActivePath = selectedImage?.path ?? null;
+    const isStillVisible =
+      lastActivePath !== null &&
+      computeSortedLibrary(useLibraryStore.getState(), useSettingsStore.getState()).some(
+        (img) => img.path === lastActivePath,
+      );
 
-    setLibrary({ libraryActivePath: lastActivePath });
+    if (isStillVisible) {
+      setLibrary({ libraryActivePath: lastActivePath });
+    } else {
+      clearLibrarySelection();
+    }
     setUI({ activeView: 'library', slideDirection: 1 });
   }, [refs]);
 
   const handleImageSelect = useCallback(
     async (path: string, openInEditor: boolean = true) => {
-      const { selectedImage, isSliderDragging, resetHistory, setEditor } = useEditorStore.getState();
-      const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
+      const generation = ++imageSelectGeneration;
+      const { selectedImage, isSliderDragging, resetHistory, stashHistory, setEditor } = useEditorStore.getState();
+      const { setLibrary } = useLibraryStore.getState();
       const { setUI } = useUIStore.getState();
+      const wasEditorVisible = useUIStore.getState().activeView === 'editor';
 
       if (openInEditor) {
         setUI({ activeView: 'editor' });
@@ -96,7 +187,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       useEditorStore.getState().patchesSentToBackend.clear();
       debouncedSave.flush();
-      debouncedSetHistory.cancel();
 
       if (selectedImage?.path && cachedEditStateRef.current) {
         globalImageCache.set(selectedImage.path, cachedEditStateRef.current);
@@ -107,21 +197,28 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       const cached = globalImageCache.get(path);
       const isFrontendCached = Boolean(cached && cached.selectedImage?.isReady);
-      const isCachedInBackend = isFrontendCached
+      const canKeepWgpuLive =
+        useSettingsStore.getState().appSettings?.useWgpuRenderer !== false &&
+        wasEditorVisible &&
+        useEditorStore.getState().wgpuPhase === 'live';
+      const isCachedInBackend = canKeepWgpuLive
         ? await invoke<boolean>('is_image_cached', { path }).catch(() => false)
         : false;
 
-      const hasDifferentResolution =
-        cached &&
-        (useEditorStore.getState().originalSize.width !== cached.originalSize.width ||
-          useEditorStore.getState().originalSize.height !== cached.originalSize.height);
+      if (generation !== imageSelectGeneration) return;
 
-      if (!isCachedInBackend || hasDifferentResolution) {
-        setEditor({ hasRenderedFirstFrame: false });
+      const keepWgpuLive = canKeepWgpuLive && isCachedInBackend && useEditorStore.getState().wgpuPhase === 'live';
+
+      if (!keepWgpuLive) {
+        await decodeImage((isFrontendCached && cached?.finalPreviewUrl) || cachedMedium);
+        if (generation !== imageSelectGeneration) return;
+        setEditor({ wgpuPhase: 'hidden' });
       }
 
+      stashHistory();
       selectedImagePathRef.current = path;
 
+      const { multiSelectedPaths } = useLibraryStore.getState();
       const newMultiSelectedPaths = multiSelectedPaths.includes(path) ? multiSelectedPaths : [path];
 
       setLibrary({
@@ -136,7 +233,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         activeMaskContainerId: null,
         activeAiPatchContainerId: null,
         activeAiSubMaskId: null,
-        isWbPickerActive: false,
+        ...canvasToolState(),
+        activeRelightLightId: null,
         previewOverride: null,
       });
 
@@ -145,14 +243,13 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         compactEditorPanelHeightOverride: null,
       });
 
-      if (isFrontendCached) {
+      if (isFrontendCached && cached) {
         setEditor({
           selectedImage: {
             ...cached.selectedImage,
             thumbnailUrl: cachedMedium || cached.selectedImage.thumbnailUrl,
           },
           originalSize: cached.originalSize,
-          previewSize: cached.previewSize,
           histogram: cached.histogram,
           waveform: cached.waveform,
           finalPreviewUrl: cached.finalPreviewUrl,
@@ -160,7 +257,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         });
 
         setEditor({ adjustments: cached.adjustments });
-        resetHistory(cached.adjustments);
+        resetHistory(cached.adjustments, path);
         prevAdjustmentsRef.current = { path, adjustments: cached.adjustments };
 
         setLibrary({ isViewLoading: false });
@@ -175,6 +272,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             isBackendReadyRef.current = true;
             currentResRef.current = 0;
             setEditor({ originalSize: { width: _result.width, height: _result.height } });
+            notifyEmbeddedPreview(_result);
           })
           .catch((err: any) => {
             if (String(err).includes('cancelled')) return;
@@ -186,15 +284,10 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         invoke(Invokes.LoadMetadata, { path })
           .then((metadata: any) => {
             if (selectedImagePathRef.current !== path) return;
-            let freshAdjustments: any;
-            if (metadata.adjustments && !metadata.adjustments.is_null) {
-              freshAdjustments = normalizeLoadedAdjustments(metadata.adjustments);
-            } else {
-              freshAdjustments = { ...INITIAL_ADJUSTMENTS };
-            }
-            if (!isSliderDragging && JSON.stringify(cached.adjustments) !== JSON.stringify(freshAdjustments)) {
+            const freshAdjustments = adjustmentsFromMetadata(metadata.adjustments);
+            if (!isSliderDragging && !isSameValue(cached.adjustments, freshAdjustments)) {
               setEditor({ adjustments: freshAdjustments });
-              resetHistory(freshAdjustments);
+              resetHistory(freshAdjustments, path);
               prevAdjustmentsRef.current = { path, adjustments: freshAdjustments };
               globalImageCache.set(path, { ...cached, adjustments: freshAdjustments });
             }
@@ -220,7 +313,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           width: 0,
         },
         originalSize: { width: 0, height: 0 },
-        previewSize: { width: 0, height: 0 },
         histogram: null,
         waveform: null,
         uncroppedAdjustedPreviewUrl: null,
@@ -255,24 +347,29 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       preloadedImages?: ImageFile[],
       expandParents = true,
       preserveEditor = false,
+      skipHistory = false,
     ) => {
       const { appSettings, handleSettingsChange } = useSettingsStore.getState();
       const { pinnedFolders } = appSettings || { pinnedFolders: [] };
       const { setLibrary, sortCriteria } = useLibraryStore.getState();
       const { setUI } = useUIStore.getState();
       const { setProcess } = useProcessStore.getState();
-      const { selectedImage, resetHistory, setEditor } = useEditorStore.getState();
+      const { selectedImage, resetHistory, stashHistory, setEditor } = useEditorStore.getState();
       const libraryViewMode = appSettings?.libraryViewMode;
+
+      if (!skipHistory && path) {
+        useLibraryStore.getState().pushNavHistory({ type: 'folder', path });
+      }
 
       if (!preserveEditor) {
         await invoke('cancel_thumbnail_generation');
         clearThumbnailQueue();
         setLibrary({ isViewLoading: true, activeAlbumId: null, libraryScrollTop: 0 });
-        setProcess({ thumbnails: {} });
+        setProcess({ thumbnails: {}, mediumThumbnails: {} });
         globalImageCache.clear();
         setUI({ activeView: 'library' });
       } else {
-        setLibrary({ isViewLoading: true });
+        setLibrary({ isViewLoading: true, activeAlbumId: null });
       }
 
       try {
@@ -286,7 +383,11 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           }
         } else if (path && expandParents) {
           const allRoots = [...(rootPaths || []), ...(pinnedFolders || [])].filter(Boolean) as string[];
-          const relevantRoot = allRoots.find((r) => path.startsWith(r));
+          const isInsideRoot = (r: string) =>
+            path === r || (path.startsWith(r) && (/[\\/]$/.test(r) || ['/', '\\'].includes(path[r.length])));
+          const relevantRoot = allRoots
+            .filter(isInsideRoot)
+            .reduce<string | undefined>((best, r) => (!best || r.length > best.length ? r : best), undefined);
 
           if (relevantRoot) {
             const separator = path.includes('/') ? '/' : '\\';
@@ -313,10 +414,10 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
         if (!preserveEditor && selectedImage) {
           debouncedSave.flush();
-          debouncedSetHistory.cancel();
+          stashHistory();
           setEditor({ selectedImage: null, finalPreviewUrl: null, uncroppedAdjustedPreviewUrl: null, histogram: null });
           setEditor({ adjustments: INITIAL_ADJUSTMENTS });
-          resetHistory(INITIAL_ADJUSTMENTS);
+          resetHistory(INITIAL_ADJUSTMENTS, null);
           useEditorStore.getState().patchesSentToBackend.clear();
         }
 
@@ -328,6 +429,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           files = preloadedImages;
         } else {
           files = await invoke(command, { path });
+          if (useLibraryStore.getState().currentFolderPath !== path) return;
         }
 
         const initialRatings: Record<string, number> = {};
@@ -338,61 +440,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         });
         setLibrary({ imageRatings: initialRatings });
 
-        const exifSortKeys = ['date_taken', 'iso', 'shutter_speed', 'aperture', 'focal_length'];
-        const isExifSortActive = exifSortKeys.includes(sortCriteria.key);
-
-        if (files.length > 0) {
-          const paths = files.map((f: ImageFile) => f.path);
-
-          if (isExifSortActive) {
-            let combinedExifMap: Record<string, any> = {};
-            const chunkSize = 100;
-
-            for (let i = 0; i < paths.length; i += chunkSize) {
-              const chunk = paths.slice(i, i + chunkSize);
-              try {
-                const chunkExif: any = await invoke(Invokes.ReadExifForPaths, { paths: chunk });
-                combinedExifMap = { ...combinedExifMap, ...chunkExif };
-              } catch (err) {
-                console.error('Failed to read EXIF chunk:', err);
-              }
-            }
-
-            const finalImageList = files.map((image) => ({
-              ...image,
-              exif: combinedExifMap[image.path] || image.exif || null,
-            }));
-            setLibrary({ imageList: finalImageList });
-          } else {
-            setLibrary({ imageList: files });
-
-            setTimeout(() => {
-              const fetchExifInChunks = async () => {
-                const chunkSize = 50;
-                for (let i = 0; i < paths.length; i += chunkSize) {
-                  if (useLibraryStore.getState().currentFolderPath !== path) break;
-
-                  const chunk = paths.slice(i, i + chunkSize);
-                  try {
-                    const chunkExif: any = await invoke(Invokes.ReadExifForPaths, { paths: chunk });
-                    setLibrary((state) => ({
-                      imageList: state.imageList.map((image) => ({
-                        ...image,
-                        exif: chunkExif[image.path] || image.exif || null,
-                      })),
-                    }));
-                    await new Promise((resolve) => setTimeout(resolve, 50));
-                  } catch (err) {
-                    console.error('Failed to read EXIF chunk:', err);
-                  }
-                }
-              };
-              fetchExifInChunks();
-            }, 500);
-          }
-        } else {
-          setLibrary({ imageList: files });
-        }
+        await loadExifForImages(files, path, sortCriteria.key, setLibrary);
 
         if (!preserveEditor) {
           invoke(Invokes.StartBackgroundIndexing, { folderPath: path }).catch((err) => {
@@ -403,16 +451,22 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         console.error('Failed to load folder contents:', err);
         toast.error('Failed to load images from the selected folder.');
       } finally {
-        useLibraryStore.getState().setLibrary({ isViewLoading: false });
+        if (useLibraryStore.getState().currentFolderPath === path) {
+          useLibraryStore.getState().setLibrary({ isViewLoading: false });
+        }
       }
     },
     [clearThumbnailQueue, refs],
   );
 
   const handleSelectAlbum = useCallback(
-    async (albumId: string, albumName: string, imagePaths: string[], preserveEditor = false) => {
-      const { setLibrary } = useLibraryStore.getState();
+    async (albumId: string, albumName: string, imagePaths: string[], preserveEditor = false, skipHistory = false) => {
+      const { setLibrary, sortCriteria } = useLibraryStore.getState();
       const { setUI } = useUIStore.getState();
+
+      if (!skipHistory) {
+        useLibraryStore.getState().pushNavHistory({ type: 'album', path: albumId, albumName, images: imagePaths });
+      }
 
       if (!preserveEditor) {
         await invoke('cancel_thumbnail_generation');
@@ -422,14 +476,23 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         setUI({ activeView: 'library' });
       }
 
+      const albumFolderPath = `Album: ${albumName}`;
+      const isCurrentAlbum = () => {
+        const { currentFolderPath, activeAlbumId } = useLibraryStore.getState();
+        return currentFolderPath === albumFolderPath && activeAlbumId === albumId;
+      };
+
       setLibrary({
         isViewLoading: true,
-        currentFolderPath: `Album: ${albumName}`,
+        currentFolderPath: albumFolderPath,
         activeAlbumId: albumId,
       });
 
       try {
-        const files: ImageFile[] = await invoke(Invokes.GetAlbumImages, { paths: imagePaths });
+        const files: ImageFile[] = isImmichAlbumId(albumId)
+          ? await getImmichAlbumImages(albumId)
+          : await invoke(Invokes.GetAlbumImages, { paths: imagePaths });
+        if (!isCurrentAlbum()) return true;
 
         const initialRatings: Record<string, number> = {};
         files.forEach((f) => {
@@ -437,21 +500,67 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
         });
 
         setLibrary({
-          imageList: files,
           imageRatings: initialRatings,
           ...(preserveEditor ? {} : { multiSelectedPaths: [], libraryActivePath: null }),
         });
+
+        await loadExifForImages(files, albumFolderPath, sortCriteria.key, setLibrary);
+        return true;
       } catch (err) {
         console.error('Failed to load album images:', err);
         toast.error(`Failed to load album: ${err}`);
+        return false;
       } finally {
-        setLibrary({ isViewLoading: false });
+        if (isCurrentAlbum()) {
+          setLibrary({ isViewLoading: false });
+        }
       }
     },
     [clearThumbnailQueue],
   );
 
-  const handleOpenFolder = async () => {
+  const handleNavBack = useCallback(async () => {
+    const { navHistory, navIndex, setLibrary } = useLibraryStore.getState();
+
+    if (navIndex > 0) {
+      const targetIndex = navIndex - 1;
+      const target = navHistory[targetIndex];
+      setLibrary({ navIndex: targetIndex });
+
+      if (target.type === 'folder') {
+        handleSelectSubfolder(target.path, false, undefined, true, false, true);
+      } else if (target.type === 'album') {
+        handleSelectAlbum(target.path, target.albumName!, target.images!, false, true);
+      }
+    }
+  }, [handleSelectSubfolder, handleSelectAlbum]);
+
+  const handleNavForward = useCallback(async () => {
+    const { navHistory, navIndex, setLibrary } = useLibraryStore.getState();
+
+    if (navIndex < navHistory.length - 1) {
+      const targetIndex = navIndex + 1;
+      const target = navHistory[targetIndex];
+      setLibrary({ navIndex: targetIndex });
+
+      if (target.type === 'folder') {
+        handleSelectSubfolder(target.path, false, undefined, true, false, true);
+      } else if (target.type === 'album') {
+        handleSelectAlbum(target.path, target.albumName!, target.images!, false, true);
+      }
+    }
+  }, [handleSelectSubfolder, handleSelectAlbum]);
+
+  const handleOpenContainingFolder = useCallback(
+    async (filePath: string) => {
+      const folderPath = await dirname(filePath);
+      if (!folderPath || useLibraryStore.getState().currentFolderPath === folderPath) return;
+      await handleSelectSubfolder(folderPath, false, undefined, true, true);
+    },
+    [handleSelectSubfolder],
+  );
+
+  const handleOpenFolder = useCallback(async () => {
     const { osPlatform, appSettings, handleSettingsChange } = useSettingsStore.getState();
     const { rootPaths, folderTrees, setLibrary } = useLibraryStore.getState();
     const isAndroid = osPlatform === 'android';
@@ -497,7 +606,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       console.error(isAndroid ? 'Failed to open Android library root:' : 'Failed to open directory dialog:', err);
       toast.error(isAndroid ? 'Failed to open library.' : 'Failed to open folder selection dialog.');
     }
-  };
+  }, [handleSelectSubfolder]);
 
   const handleContinueSession = () => {
     const restore = async () => {
@@ -578,7 +687,10 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             const album = findObj(albumTree);
             if (album) {
               await handleSelectAlbum(album.id, album.name, album.images);
-            } else {
+            } else if (
+              !isImmichAlbumId(activeAlbumId) ||
+              !(await handleSelectAlbum(activeAlbumId, pathToSelect.slice('Album: '.length), []))
+            ) {
               await handleSelectSubfolder(rootFolders[0], false, undefined, false);
             }
           } catch (e) {
@@ -608,6 +720,9 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     handleSelectSubfolder,
     handleSelectAlbum,
     handleOpenFolder,
+    handleOpenContainingFolder,
+    handleNavBack,
+    handleNavForward,
     handleContinueSession,
   };
 }

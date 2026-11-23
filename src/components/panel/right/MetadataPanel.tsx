@@ -4,17 +4,20 @@ import { Check, ChevronDown, ChevronRight, Plus, Star, Tag, X, User } from 'luci
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
-import { Invokes } from '../../ui/AppProperties';
+import { Invokes } from '../../../types/invokes';
+import FlagToggles from '../library/FlagToggles';
+import { getImageFlag } from '../../../utils/imageFlags';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import Text from '../../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../../types/typography';
-import { IconAperture, IconShutter, IconIso, IconFocalLength, IconLens } from '../editor/ExifIcons';
+import { IconAperture, IconShutter, IconIso, IconFocalLength, IconLens, IconCamera } from '../editor/ExifIcons';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useLibraryStore } from '../../../store/useLibraryStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useProcessStore } from '../../../store/useProcessStore';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { expandGroupedPaths } from '../../../utils/imageGrouping';
+import type { ParseKeys } from 'i18next';
 
 interface CameraSetting {
   format?(value: number): string | number;
@@ -27,6 +30,8 @@ interface CameraSettings {
   FNumber: CameraSetting;
   FocalLengthIn35mmFilm: CameraSetting;
   LensModel: CameraSetting;
+  Make: CameraSetting;
+  Model: CameraSetting;
   PhotographicSensitivity: CameraSetting;
 }
 
@@ -64,6 +69,7 @@ const CAMERA_ICONS: Record<string, React.FC> = {
   ExposureTime: IconShutter,
   PhotographicSensitivity: IconIso,
   FocalLengthIn35mmFilm: IconFocalLength,
+  Model: IconCamera,
   LensModel: IconLens,
 };
 
@@ -203,7 +209,7 @@ const EDITABLE_FIELDS = [
   { key: 'Artist', label: 'author' },
   { key: 'Copyright', label: 'copyright' },
   { key: 'UserComment', label: 'comments' },
-];
+] as const;
 
 const KEY_CAMERA_SETTINGS_MAP: CameraSettings = {
   FNumber: {
@@ -225,6 +231,14 @@ const KEY_CAMERA_SETTINGS_MAP: CameraSettings = {
     format: (value: number) => (String(value).endsWith('mm') ? value : `${value} mm`),
     label: 'Focal Length',
   },
+  Make: {
+    format: (value: number) => String(value).replace(/"/g, ''),
+    label: 'Camera Make',
+  },
+  Model: {
+    format: (value: number) => String(value).replace(/"/g, ''),
+    label: 'Camera Model',
+  },
   LensModel: {
     format: (value: number) => String(value).replace(/"/g, ''),
     label: 'Lens',
@@ -241,16 +255,17 @@ export default function MetadataPanel() {
   const multiSelectedPaths = useLibraryStore((s) => s.multiSelectedPaths);
   const imageRatings = useLibraryStore((s) => s.imageRatings);
   const appSettings = useSettingsStore((s) => s.appSettings);
-  const thumbnails = useProcessStore((s) => s.thumbnails);
+  const liveThumbnailUrl = useProcessStore((s) => (selectedImage ? s.thumbnails[selectedImage.path] : undefined));
 
-  const { handleRate, handleSetColorLabel, handleTagsChanged, handleUpdateExif } = useLibraryActions();
+  const { handleRate, handleToggleFlag, handleSetColorLabel, handleTagsChanged, handleUpdateExif } =
+    useLibraryActions();
 
   const rating = selectedImage ? imageRatings[selectedImage.path] || 0 : 0;
+  const flag = useLibraryStore((state) => getImageFlag(state.imageList, selectedImage?.path));
   const tags = useLibraryStore((state) => {
     if (!selectedImage) return EMPTY_TAGS;
     return state.imageList.find((img) => img.path === selectedImage.path)?.tags ?? EMPTY_TAGS;
   });
-  const liveThumbnailUrl = selectedImage ? thumbnails[selectedImage.path] : undefined;
 
   const targetPaths = multiSelectedPaths?.length > 0 ? multiSelectedPaths : selectedImage ? [selectedImage.path] : [];
   const getPathsToUpdate = () => {
@@ -259,7 +274,7 @@ export default function MetadataPanel() {
     return expandGroupedPaths(imageList, targetPaths, groupingMode);
   };
 
-  const { cameraGridSettings, lensSetting, gpsData, otherExifEntries } = useMemo(() => {
+  const { cameraGridSettings, lensSetting, cameraMakeModelSetting, gpsData, otherExifEntries } = useMemo(() => {
     const exif = selectedImage?.exif || {};
 
     const cameraGridKeys = ['ExposureTime', 'FNumber', 'PhotographicSensitivity', 'FocalLengthIn35mmFilm'];
@@ -303,6 +318,20 @@ export default function MetadataPanel() {
             : '-',
     };
 
+    const cameraMakeModel = (['Make', 'Model'] as const)
+      .map((key) => {
+        const value = exif[key];
+        if (value === undefined || value === null || value === '') return '';
+        return String(KEY_CAMERA_SETTINGS_MAP[key].format!(value as number)).trim();
+      })
+      .filter(Boolean)
+      .join(' ');
+    const cameraMakeModelSetting = {
+      key: 'Model',
+      label: t('editor.metadata.camera.model'),
+      value: cameraMakeModel || '-',
+    };
+
     const latStr = exif.GPSLatitude;
     const latRef = exif.GPSLatitudeRef;
     const lonStr = exif.GPSLongitude;
@@ -323,7 +352,7 @@ export default function MetadataPanel() {
       .filter(([key]) => !handledKeys.includes(key))
       .sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
 
-    return { cameraGridSettings, lensSetting, gpsData, otherExifEntries };
+    return { cameraGridSettings, lensSetting, cameraMakeModelSetting, gpsData, otherExifEntries };
   }, [selectedImage?.exif, t]);
 
   const currentColor = useMemo(() => {
@@ -390,6 +419,7 @@ export default function MetadataPanel() {
   };
 
   const LensIcon = CAMERA_ICONS['LensModel'];
+  const CameraIcon = CAMERA_ICONS['Model'];
 
   return (
     <div className="flex flex-col h-full">
@@ -486,7 +516,25 @@ export default function MetadataPanel() {
                     );
                   })}
                 </div>
-
+                <div
+                  className="flex items-center gap-2 bg-surface border border-surface px-3 py-2 rounded-xl cursor-default"
+                  data-tooltip={cameraMakeModelSetting.label}
+                >
+                  {CameraIcon && (
+                    <span className="text-text-secondary opacity-90 flex items-center justify-center shrink-0">
+                      <CameraIcon />
+                    </span>
+                  )}
+                  <Text
+                    as="span"
+                    variant={TextVariants.small}
+                    weight={TextWeights.medium}
+                    color={TextColors.primary}
+                    className="truncate"
+                  >
+                    {cameraMakeModelSetting.value}
+                  </Text>
+                </div>
                 <div
                   className="flex items-center gap-2 bg-surface border border-surface px-3 py-2 rounded-xl cursor-default"
                   data-tooltip={lensSetting.label}
@@ -548,7 +596,7 @@ export default function MetadataPanel() {
                           return (
                             <EditableMetadataItem
                               key={field.key}
-                              label={t(`editor.metadata.fields.${field.label}`)}
+                              label={t(`editor.metadata.fields.${field.label}` as ParseKeys)}
                               value={displayValue}
                               onSave={(newVal) => {
                                 handleUpdateExif(targetPaths, { [field.key]: newVal });
@@ -622,6 +670,13 @@ export default function MetadataPanel() {
                                 />
                               </button>
                             ))}
+                            <div className="w-px h-4 bg-surface mx-1" />
+                            <FlagToggles
+                              flag={flag}
+                              onToggle={(option) => handleToggleFlag(option, targetPaths)}
+                              inactiveClassName="text-text-secondary hover:text-text-primary"
+                              size={20}
+                            />
                           </div>
                         </div>
                         <div>
